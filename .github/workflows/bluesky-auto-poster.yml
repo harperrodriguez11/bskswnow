@@ -1,0 +1,124 @@
+name: Bluesky Auto Poster
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      account_row:
+        description: >
+          OPTIONAL. Leave blank to auto-run the accounts already assigned to
+          THIS repository (up to MAX_ACCOUNTS_PER_RUN). Fill in a single row
+          number to force this run onto just that one row (bypasses assignment
+          lock and the per-run limit).
+        required: false
+        default: ""
+      max_accounts:
+        description: >
+          OPTIONAL. Overrides the Settings-sheet MAX_ACCOUNTS_PER_RUN cap for
+          this run only. This is the hard ceiling on how many account jobs
+          THIS repository will launch. Once accounts are assigned to this
+          repo they stay sticky across future schedules; other repos will
+          never touch them.
+        required: false
+        default: ""
+
+concurrency:
+  group: bluesky-poster
+  cancel-in-progress: false
+
+jobs:
+  # ── Step 1: figure out which account rows THIS repo owns / may claim ─────
+  discover-accounts:
+    runs-on: ubuntu-latest
+    outputs:
+      rows: ${{ steps.discover.outputs.rows }}
+      count: ${{ steps.discover.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4 grapheme
+      - name: Install rclone (media lives on Mega)
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+      - name: Write rclone config (Mega — media only)
+        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
+        env:
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
+      - name: Write Google service-account credentials
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > google_creds.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      - name: Discover eligible accounts (sticky per-repo assignment)
+        id: discover
+        run: python -u postnow_status_post.py --discover
+        env:
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
+          FORCE_ACCOUNT_ROW: ${{ github.event.inputs.account_row }}
+          MAX_ACCOUNTS_PER_RUN: ${{ github.event.inputs.max_accounts }}
+          SHEETS_RETRY_BUDGET_SECONDS: "240"
+          SHEETS_MAX_BACKOFF_SECONDS: "60"
+      - name: Clean up credentials
+        if: always()
+        run: rm -f rclone.conf google_creds.json
+
+  # ── Step 2: one job per assigned account, run in parallel ────────────────
+  post:
+    needs: discover-accounts
+    if: needs.discover-accounts.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      # Do NOT set max-parallel. Each job holds its matrix slot for the whole
+      # run because the Python script loops internally. Quota protection comes
+      # from batched Sheets calls + START_JITTER_MAX_SECONDS + retry/backoff.
+      matrix:
+        account_row: ${{ fromJson(format('[{0}]', needs.discover-accounts.outputs.rows)) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install google-api-python-client google-auth atproto Pillow requests beautifulsoup4 grapheme
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+          rclone version
+      - name: Write rclone config (Mega — media only)
+        run: echo "$MEGA_RCLONE_CONF" > rclone.conf
+        env:
+          MEGA_RCLONE_CONF: ${{ secrets.MEGA_RCLONE_CONF }}
+      - name: Write Google service-account credentials
+        run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > google_creds.json
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      - name: Run poster loop for this account
+        run: python -u postnow_status_post.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          RCLONE_CONFIG_PATH: rclone.conf
+          RCLONE_REMOTE_NAME: mega
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: google_creds.json
+          ACCOUNT_ROW: ${{ matrix.account_row }}
+          SHEETS_RETRY_BUDGET_SECONDS: "240"
+          SHEETS_MAX_BACKOFF_SECONDS: "60"
+          START_JITTER_MAX_SECONDS: "120"
+          SHEETS_CALL_PACING_SECONDS: "0.3"
+      - name: Clean up credentials
+        if: always()
+        run: rm -f rclone.conf google_creds.json
+      # Banned/suspended/auth-failed accounts are written to ACCOUNT_STATUS
+      # and automatically excluded from future discover runs. No workflow-level
+      # disable is needed — one bad account never takes the others offline.
