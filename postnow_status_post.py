@@ -1415,6 +1415,16 @@ def print_config_summary():
 # ═══════════════════════════════════════════════════════════════════════════
 #  REPORT TAB
 # ═══════════════════════════════════════════════════════════════════════════
+# Columns (fixed, 1-based):
+#   A Timestamp (UTC) | B Handle | C Followers | D Gained
+#   E Top Post        | F Engagement | G Status
+#
+# Writing strategy: never rely on Sheets "table detection" via append to A:G
+# (that is what caused rows to land in the wrong columns when the sheet had
+# extra blank columns, filters, or a mismatched header). Instead we:
+#   1. Ensure the header row is exactly REPORT_HEADER.
+#   2. Find the next empty data row by reading column A.
+#   3. Write the 7 values into that exact A{n}:G{n} range with values.update.
 
 def _now_str():
     return time.strftime("%Y-%m-%d %H:%M", time.gmtime()) + " UTC"
@@ -1426,12 +1436,61 @@ def _parse_report_ts(s):
         return None
 
 
+def _normalize_handle(h):
+    """Compare handles without a leading @ and case-insensitively."""
+    return (h or "").strip().lstrip("@").lower()
+
+
+def _sanitize_report_text(s, max_len=200):
+    """Collapse whitespace/newlines so Top Post stays in a single clean cell."""
+    if s is None:
+        return ""
+    text = re.sub(r"[\r\n\t]+", " ", str(s))
+    text = re.sub(r" {2,}", " ", text).strip()
+    if len(text) > max_len:
+        text = text[: max_len - 1] + "…"
+    return text
+
+
+def ensure_report_header():
+    """Make sure Report!A1:G1 is exactly REPORT_HEADER. Fixes a tab that was
+    created manually with extra/missing columns so new rows always land in
+    A–G under the right titles."""
+    res = sheets_get(qrange(REPORT_TAB, "1:1"))
+    rows = res.get("values", [])
+    existing = [str(c).strip() if c is not None else "" for c in (rows[0] if rows else [])]
+    # Pad / trim to 7 for comparison
+    existing_norm = (existing + [""] * 7)[:7]
+    expected = list(REPORT_HEADER)
+    if existing_norm == expected:
+        return
+    sheets_update(qrange(REPORT_TAB, "A1:G1"), [expected])
+    print(f"Report header repaired to: {expected}")
+
+
+def _next_report_row():
+    """Return the 1-based sheet row number where the next report entry should
+    be written (first empty cell in column A after the header)."""
+    res = sheets_get(qrange(REPORT_TAB, "A:A"))
+    values = res.get("values", [])
+    # values[0] is header (row 1). First completely empty row after that.
+    for i, row in enumerate(values):
+        if i == 0:
+            continue  # skip header
+        cell0 = str(row[0]).strip() if row and row[0] is not None else ""
+        if not cell0:
+            return i + 1  # 1-based
+    return len(values) + 1  # append after last used row
+
+
 def _last_report_for_handle(handle):
-    """Reads from the already-cached core data — no extra API call."""
+    """Reads from the already-cached core data — no extra API call.
+    Matches handle with or without leading @."""
     report_values = load_core_data()["report"]
+    target = _normalize_handle(handle)
     for r in range(len(report_values), 1, -1):
         h = cell(report_values, r, 2)
-        if h == handle:
+        if _normalize_handle(h) == target:
             ts = cell(report_values, r, 1)
             followers = None
             f_raw = cell(report_values, r, 3)
@@ -1457,8 +1516,48 @@ def _report_due(handle, times_per_day):
 
 
 def _append_report(rows):
-    sheets_append(qrange(REPORT_TAB, "A:G"), rows)
+    """Write one or more report rows into the correct A–G columns.
+
+    `rows` is a list of 7-element lists:
+      [Timestamp, Handle, Followers, Gained, Top Post, Engagement, Status]
+
+    Uses an explicit next-row `values.update` instead of `values.append` so
+    data cannot drift into extra columns when the sheet has blank columns,
+    filters, or a previously-mismatched header.
+    """
+    if not rows:
+        return
+    ensure_report_header()
+    start_row = _next_report_row()
+    # Normalize every row to exactly 7 columns with clean types
+    clean = []
+    for row in rows:
+        r = list(row) + [""] * 7
+        r = r[:7]
+        # A Timestamp, B Handle, C Followers, D Gained, E Top Post, F Engagement, G Status
+        ts       = str(r[0] or "")
+        handle   = str(r[1] or "").lstrip("@")  # store without leading @ for consistency
+        try:
+            followers = int(float(r[2])) if str(r[2]).strip() != "" else ""
+        except (ValueError, TypeError):
+            followers = str(r[2] or "")
+        try:
+            gained = int(float(r[3])) if str(r[3]).strip() != "" else ""
+        except (ValueError, TypeError):
+            gained = str(r[3] or "")
+        top_post = _sanitize_report_text(r[4], max_len=250)
+        try:
+            engagement = int(float(r[5])) if str(r[5]).strip() != "" else ""
+        except (ValueError, TypeError):
+            engagement = str(r[5] or "")
+        status = str(r[6] or "")
+        clean.append([ts, handle, followers, gained, top_post, engagement, status])
+
+    end_row = start_row + len(clean) - 1
+    rng = qrange(REPORT_TAB, f"A{start_row}:G{end_row}")
+    sheets_update(rng, clean)
     load_core_data(force=True)   # refresh cache so subsequent checks this cycle see the new row
+    print(f"Report row(s) written to {REPORT_TAB}!A{start_row}:G{end_row}")
 
 
 def _top_post_summary(client, handle, top_n, within):
@@ -1493,12 +1592,12 @@ def _top_post_summary(client, handle, top_n, within):
 
     if len(ranked) == 1:
         p = ranked[0]
-        preview = p["text"][:100] + ("…" if len(p["text"]) > 100 else "")
+        preview = _sanitize_report_text(p["text"], max_len=100)
         return preview, p["engagement"]
 
     parts = []
     for i, p in enumerate(ranked, start=1):
-        preview = p["text"][:60] + ("…" if len(p["text"]) > 60 else "")
+        preview = _sanitize_report_text(p["text"], max_len=60)
         parts.append(f"{i}) {preview} ({p['engagement']})")
     return " | ".join(parts), ranked[0]["engagement"]
 
@@ -1511,7 +1610,7 @@ def generate_report(client, handle, cfg):
         return
     try:
         profile = client.get_profile(actor=handle)
-        total   = profile.followers_count or 0
+        total   = int(profile.followers_count or 0)
 
         _, prev_followers = _last_report_for_handle(handle)
         prev   = prev_followers if prev_followers is not None else total
@@ -1521,12 +1620,22 @@ def generate_report(client, handle, cfg):
             client, handle, cfg["top_posts_count"], cfg["top_posts_within"]
         )
 
-        row = [_now_str(), handle, total, gained, top_preview, top_engagement, "OK"]
+        # Exactly 7 columns matching REPORT_HEADER / A–G
+        row = [
+            _now_str(),          # A Timestamp (UTC)
+            handle.lstrip("@"),  # B Handle (no leading @)
+            total,               # C Followers (number)
+            gained,              # D Gained (number)
+            top_preview,         # E Top Post (single-line text)
+            int(top_engagement or 0),  # F Engagement (number)
+            "OK",                # G Status
+        ]
         _append_report([row])
         print(f"Report logged for {handle}: {total} followers ({gained:+d} since last), "
               f"top post engagement={top_engagement}.")
     except Exception as exc:
         print(f"Warning: report generation failed: {exc}")
+        traceback.print_exc()
 
 
 def run_report(client, handle, cfg):
@@ -2847,6 +2956,7 @@ def main():
         ])
         ensure_extra_columns(PROXIES_TAB, PROXY_TRACKING_COLUMNS)
         ensure_settings_defaults()
+        ensure_report_header()   # keep Report A1:G1 aligned so rows land in correct columns
         ACCOUNT_ROW = resolve_account_row()
         load_account_config()
     except Exception as exc:
