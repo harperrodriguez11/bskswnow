@@ -2251,6 +2251,11 @@ def _kind_from_filename(filename):
     return None
 
 
+# Files that failed to post twice in this process are skipped so one bad file
+# can't block the whole queue forever.
+_BAD_MEDIA = {}
+
+
 def fetch_media_matching_plan(preferred_kind, plan):
     cfg           = _cfg()
     upload_folder = cfg["mega_upload_folder"]
@@ -2260,7 +2265,8 @@ def fetch_media_matching_plan(preferred_kind, plan):
     remote_folder = f"{RCLONE_REMOTE_NAME}:{upload_folder}"
     files = rclone_list_files(remote_folder)
     candidates = [f for f in files if not f.startswith(CLAIM_PREFIX)
-                  and _kind_from_filename(f) == preferred_kind]
+                  and _kind_from_filename(f) == preferred_kind
+                  and _BAD_MEDIA.get(f, 0) < 2]
 
     counters = {"claim": 0, "plan": 0, "posted": 0}
 
@@ -2295,90 +2301,165 @@ def fetch_media_matching_plan(preferred_kind, plan):
     return None, None, None, None, None
 
 
-def _major_brand(path):
-    """Return the container's major_brand (e.g. 'isom', 'mp42', 'qt  '),
-    or '' if ffprobe is unavailable / fails."""
+# ── MP4 / QuickTime handling ───────────────────────────────────────────────
+# Bluesky only accepts video/mp4. The server decides the type by SNIFFING the
+# file bytes (not the extension): a MOV/QuickTime file named ".mp4" is rejected
+# with  Expected "video/mp4" (got "video/quicktime").
+# We therefore (1) read the real container brand ourselves in pure Python,
+# (2) only convert when needed, (3) get an ffmpeg binary even if the runner
+# doesn't have one, and (4) verify the result before posting.
+
+_FFMPEG_BIN = None
+_FFMPEG_TRIED = False
+
+
+def _get_ffmpeg():
+    """Return a usable ffmpeg executable path, or None.
+    Order: system ffmpeg -> pip 'imageio-ffmpeg' (bundled static binary, no
+    root needed) -> sudo apt-get install ffmpeg. Result cached per process."""
+    global _FFMPEG_BIN, _FFMPEG_TRIED
+    if _FFMPEG_TRIED:
+        return _FFMPEG_BIN
+    _FFMPEG_TRIED = True
+
+    import shutil
+    found = shutil.which("ffmpeg")
+    if found:
+        _FFMPEG_BIN = found
+        return _FFMPEG_BIN
+
+    print("ffmpeg not found on this runner — trying pip install imageio-ffmpeg …")
     try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format_tags=major_brand",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True, timeout=60,
-        )
-        return r.stdout.strip("\r\n")   # keep trailing spaces: 'qt  ' != 'qt'
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                        "--break-system-packages", "imageio-ffmpeg"],
+                       capture_output=True, text=True, timeout=300)
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.exists(exe):
+            _FFMPEG_BIN = exe
+            print(f"Using bundled ffmpeg: {exe}")
+            return _FFMPEG_BIN
+    except Exception as exc:
+        print(f"Warning: imageio-ffmpeg install failed: {exc}")
+
+    print("Trying apt-get install ffmpeg …")
+    try:
+        subprocess.run(["sudo", "-n", "apt-get", "install", "-y", "-qq", "ffmpeg"],
+                       capture_output=True, text=True, timeout=600)
+        found = shutil.which("ffmpeg")
+        if found:
+            _FFMPEG_BIN = found
+            return _FFMPEG_BIN
+    except Exception as exc:
+        print(f"Warning: apt-get ffmpeg install failed: {exc}")
+
+    print("ERROR: no ffmpeg available — will use the pure-Python brand patch as a last resort.")
+    return None
+
+
+def _read_brand(path):
+    """Container major brand read straight from the file bytes.
+    Returns e.g. 'isom', 'mp42', 'qt  ', or None if the file does not start
+    with an 'ftyp' box (old-style MOV with moov/mdat/free first — the server
+    also sniffs those as QuickTime)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+        if len(head) >= 12 and head[4:8] == b"ftyp":
+            return head[8:12].decode("latin-1")
     except Exception:
-        return ""
+        pass
+    return None
 
 
-def _is_quicktime_brand(brand):
-    return brand.lower().startswith("qt")
+def _brand_ok(brand):
+    return brand is not None and not brand.lower().startswith("qt")
+
+
+def _patch_brand_in_place(src, dst):
+    """Last resort without ffmpeg: copy the file and rewrite the ftyp major
+    brand 'qt  ' -> 'mp42' so the server sniffs it as MP4. Only possible when
+    the file already starts with an ftyp box."""
+    if _read_brand(src) is None:
+        return False
+    import shutil
+    shutil.copyfile(src, dst)
+    with open(dst, "r+b") as f:
+        f.seek(8)
+        f.write(b"mp42")
+    return _brand_ok(_read_brand(dst))
 
 
 def ensure_real_mp4(local_path, force_reencode=False):
-    """Bluesky only accepts video/mp4. A file named .mp4 can still be a
-    QuickTime/MOV container (major brand 'qt  '), which the server rejects
-    with: Expected "video/mp4" (got "video/quicktime").
+    """Make sure `local_path` is a genuine MP4 that Bluesky will accept.
+    Returns the path to post (a new *_fixed.mp4 file if conversion happened)."""
+    brand = _read_brand(local_path)
+    print(f"Video container brand: {brand!r}")
 
-    Strategy:
-      1. Stream-copy into a fresh MP4 (video + audio only; data/timecode
-         tracks and metadata dropped, brand forced to mp42). Fast, lossless.
-      2. Check the result's brand. If it still looks like QuickTime, or the
-         copy failed, or force_reencode=True, re-encode H.264 + AAC.
-    Always writes a NEW file, returns its path (or the original path only if
-    ffmpeg is missing / every attempt failed)."""
+    if _brand_ok(brand) and not force_reencode:
+        print("Video is already a proper MP4 — no conversion needed.")
+        return local_path
+
     base = os.path.splitext(local_path)[0]
     out  = f"{base}_fixed.mp4"
+    ffmpeg = _get_ffmpeg()
 
-    brand_before = _major_brand(local_path)
-    print(f"Video container brand before: {brand_before!r}")
-
-    common_in  = ["ffmpeg", "-y", "-v", "error", "-i", local_path,
-                  "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-map_metadata", "-1"]
-    common_out = ["-movflags", "+faststart", "-brand", "mp42", "-f", "mp4", out]
-
-    attempts = []
-    if not force_reencode:
-        attempts.append(("stream-copy", common_in + ["-c", "copy"] + common_out))
-    attempts.append(("re-encode", common_in + [
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k", "-ac", "2"] + common_out))
-
-    for label, cmd in attempts:
-        try:
-            if os.path.exists(out):
+    def _cleanup_out():
+        if os.path.exists(out):
+            try:
                 os.remove(out)
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        except FileNotFoundError:
-            print("ERROR: ffmpeg is not installed on this runner — cannot fix MOV/QuickTime videos. "
-                  "Add a step: sudo apt-get update && sudo apt-get install -y ffmpeg")
-            return local_path
-        except Exception as exc:
-            print(f"Warning: ffmpeg {label} failed to run: {exc}")
-            continue
+            except OSError:
+                pass
 
-        if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
-            print(f"Warning: ffmpeg {label} failed: {(r.stderr or '').strip()[-300:]}")
-            continue
+    if ffmpeg:
+        common_in  = [ffmpeg, "-y", "-v", "error", "-i", local_path,
+                      "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-map_metadata", "-1"]
+        common_out = ["-movflags", "+faststart", "-brand", "mp42", "-f", "mp4", out]
+        attempts = []
+        if not force_reencode:
+            attempts.append(("stream-copy", common_in + ["-c", "copy"] + common_out))
+        attempts.append(("re-encode", common_in + [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2"] + common_out))
 
-        brand_after = _major_brand(out)
-        if _is_quicktime_brand(brand_after):
-            print(f"Warning: {label} output still has QuickTime brand {brand_after!r} — trying next method.")
-            continue
-
-        print(f"Video fixed via {label}: brand {brand_before!r} → {brand_after!r}, "
-              f"{os.path.getsize(out)/(1024*1024):.1f} MB.")
-        if out != local_path:
+        for label, cmd in attempts:
+            _cleanup_out()
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            except Exception as exc:
+                print(f"Warning: ffmpeg {label} could not run: {exc}")
+                continue
+            if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+                print(f"Warning: ffmpeg {label} failed: {(r.stderr or '').strip()[-300:]}")
+                continue
+            new_brand = _read_brand(out)
+            if not _brand_ok(new_brand):
+                print(f"Warning: {label} output still not a proper MP4 (brand {new_brand!r}).")
+                continue
+            print(f"Video fixed via {label}: {brand!r} → {new_brand!r}, "
+                  f"{os.path.getsize(out)/(1024*1024):.1f} MB.")
             try:
                 os.remove(local_path)
             except OSError:
                 pass
-        return out
+            return out
+        _cleanup_out()
 
-    print("Warning: could not convert video to a proper MP4; posting the original file.")
-    if os.path.exists(out):
-        try:
-            os.remove(out)
-        except OSError:
-            pass
+    # Last resort (no ffmpeg, or ffmpeg failed): patch the brand bytes.
+    try:
+        if _patch_brand_in_place(local_path, out):
+            print(f"Video fixed via brand patch (no re-encode): {brand!r} → {_read_brand(out)!r}.")
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+            return out
+    except Exception as exc:
+        print(f"Warning: brand patch failed: {exc}")
+    _cleanup_out()
+
+    print("WARNING: could not convert this video to a proper MP4 — posting original; "
+          "Bluesky will probably reject it.")
     return local_path
 
 
@@ -2842,6 +2923,9 @@ def run_once():
             release_claim(claimed_name, original_name)
             raise AccountTakenDownError(f"Account {handle} taken down mid-cycle.") from exc
         release_claim(claimed_name, original_name)
+        _BAD_MEDIA[original_name] = _BAD_MEDIA.get(original_name, 0) + 1
+        if _BAD_MEDIA[original_name] >= 2:
+            print(f"'{original_name}' has failed {_BAD_MEDIA[original_name]}x — skipping it for the rest of this run.")
         print(f"Post failed — claim released, file stays in upload folder.")
         raise
 
