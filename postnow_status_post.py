@@ -75,33 +75,7 @@ LOCK_TTL_MINUTES = 45   # business-level "which repo owns this account row" hear
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENV / VALUE PARSING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
-def ensure_real_mp4(local_path):
-    """Bluesky rejects MOV/QuickTime data even when the file is named .mp4.
-    Re-wrap into a true MP4 container (stream copy, no quality loss);
-    fall back to a re-encode if copy isn't possible."""
-    base = os.path.splitext(local_path)[0]
-    out = f"{base}_fixed.mp4"
-    attempts = [
-        ["ffmpeg", "-y", "-i", local_path, "-c", "copy",
-         "-movflags", "+faststart", out],
-        ["ffmpeg", "-y", "-i", local_path, "-c:v", "libx264", "-preset", "veryfast",
-         "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-         "-movflags", "+faststart", out],
-    ]
-    for cmd in attempts:
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
-                print(f"Re-wrapped video as MP4 ({'copy' if '-c' in cmd and 'copy' in cmd else 're-encode'}).")
-                try:
-                    os.remove(local_path)
-                except OSError:
-                    pass
-                return out
-        except Exception as exc:
-            print(f"Warning: ffmpeg step failed: {exc}")
-    print("Warning: could not convert video; posting original file.")
-    return local_path
+
 def get_env(name, required=True, default=""):
     v = os.getenv(name)
     if v is None or not v.strip():
@@ -2321,6 +2295,93 @@ def fetch_media_matching_plan(preferred_kind, plan):
     return None, None, None, None, None
 
 
+def _major_brand(path):
+    """Return the container's major_brand (e.g. 'isom', 'mp42', 'qt  '),
+    or '' if ffprobe is unavailable / fails."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format_tags=major_brand",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=60,
+        )
+        return r.stdout.strip("\r\n")   # keep trailing spaces: 'qt  ' != 'qt'
+    except Exception:
+        return ""
+
+
+def _is_quicktime_brand(brand):
+    return brand.lower().startswith("qt")
+
+
+def ensure_real_mp4(local_path, force_reencode=False):
+    """Bluesky only accepts video/mp4. A file named .mp4 can still be a
+    QuickTime/MOV container (major brand 'qt  '), which the server rejects
+    with: Expected "video/mp4" (got "video/quicktime").
+
+    Strategy:
+      1. Stream-copy into a fresh MP4 (video + audio only; data/timecode
+         tracks and metadata dropped, brand forced to mp42). Fast, lossless.
+      2. Check the result's brand. If it still looks like QuickTime, or the
+         copy failed, or force_reencode=True, re-encode H.264 + AAC.
+    Always writes a NEW file, returns its path (or the original path only if
+    ffmpeg is missing / every attempt failed)."""
+    base = os.path.splitext(local_path)[0]
+    out  = f"{base}_fixed.mp4"
+
+    brand_before = _major_brand(local_path)
+    print(f"Video container brand before: {brand_before!r}")
+
+    common_in  = ["ffmpeg", "-y", "-v", "error", "-i", local_path,
+                  "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-map_metadata", "-1"]
+    common_out = ["-movflags", "+faststart", "-brand", "mp42", "-f", "mp4", out]
+
+    attempts = []
+    if not force_reencode:
+        attempts.append(("stream-copy", common_in + ["-c", "copy"] + common_out))
+    attempts.append(("re-encode", common_in + [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2"] + common_out))
+
+    for label, cmd in attempts:
+        try:
+            if os.path.exists(out):
+                os.remove(out)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        except FileNotFoundError:
+            print("ERROR: ffmpeg is not installed on this runner — cannot fix MOV/QuickTime videos. "
+                  "Add a step: sudo apt-get update && sudo apt-get install -y ffmpeg")
+            return local_path
+        except Exception as exc:
+            print(f"Warning: ffmpeg {label} failed to run: {exc}")
+            continue
+
+        if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+            print(f"Warning: ffmpeg {label} failed: {(r.stderr or '').strip()[-300:]}")
+            continue
+
+        brand_after = _major_brand(out)
+        if _is_quicktime_brand(brand_after):
+            print(f"Warning: {label} output still has QuickTime brand {brand_after!r} — trying next method.")
+            continue
+
+        print(f"Video fixed via {label}: brand {brand_before!r} → {brand_after!r}, "
+              f"{os.path.getsize(out)/(1024*1024):.1f} MB.")
+        if out != local_path:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+        return out
+
+    print("Warning: could not convert video to a proper MP4; posting the original file.")
+    if os.path.exists(out):
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+    return local_path
+
+
 def compress_image_under_limit(local_path):
     from PIL import Image
     max_bytes = _cfg()["max_image_bytes"]
@@ -2492,8 +2553,20 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
         link_mode=link_mode, rich_display=rich_display,
     )
     if kind == "video":
-        with open(local_path, "rb") as f:
-            client.send_video(text=tb, video=f.read(), video_alt=media_name)
+        try:
+            with open(local_path, "rb") as f:
+                client.send_video(text=tb, video=f.read(), video_alt=media_name)
+        except Exception as exc:
+            msg = str(exc)
+            if "video/quicktime" in msg or 'Expected "video/mp4"' in msg:
+                # Server still sniffed the upload as QuickTime. Force a full
+                # re-encode to a clean H.264/AAC MP4 and retry once.
+                print("Server rejected video as QuickTime — forcing full re-encode and retrying once…")
+                local_path = ensure_real_mp4(local_path, force_reencode=True)
+                with open(local_path, "rb") as f:
+                    client.send_video(text=tb, video=f.read(), video_alt=media_name)
+            else:
+                raise
     else:
         with open(local_path, "rb") as f:
             client.send_image(text=tb, image=f.read(), image_alt=media_name)
@@ -2508,6 +2581,7 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
         print(f"  Action: {action_line} → {link_info}")
     if tags:
         print(f"  Tags: {' '.join('#'+t for t in tags)}")
+    return local_path   # may differ from the input if the video was re-encoded
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2760,7 +2834,7 @@ def run_once():
 
         # The raw sheet caption is passed through; CAPTION_MODE / CAPTION_ENABLED
         # are applied inside resolve_body_caption().
-        post_to_bluesky(client, original_name, path, kind, caption, tags, add_link)
+        path = post_to_bluesky(client, original_name, path, kind, caption, tags, add_link)
 
     except Exception as exc:
         err = str(exc)
