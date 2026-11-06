@@ -4,99 +4,40 @@ Bluesky auto-poster.
 
 Coordination data (Credentials / Settings / PostPlan / LinkPlan / Report)
 lives in a Google Sheet, read/written via the Sheets API v4. Media files
-(images/videos) still live on Mega, accessed via rclone — unchanged.
+(images/videos) still live on Mega, accessed via rclone.
 
-WHY GOOGLE SHEETS DOESN'T NEED A WORKBOOK-WIDE LOCK
+CAPTION MODES (new)
 ────────────────────────────────────────────────────
-The old Mega-workbook version needed a real distributed lock because a
-".xlsx on Mega" has no per-cell API: every write meant "download the whole
-file, change it, upload the whole file back", so two runners touching it at
-once could corrupt each other's changes.
+Controlled live from the Settings tab (or per-account via a Credentials
+column with the same name):
 
-The Sheets API has no such problem — `values.update` / `values.batchUpdate`
-write to specific cells/rows without touching anything else, and Google
-serializes concurrent writes to the same cell for you. So this version
-drops the whole-workbook lock entirely. What's left is the same *business*
-locks it always had:
-  - a soft, TTL-based "which repo currently owns this account row" lock
-    (LOCKED_BY / LOCKED_AT columns) — unchanged in spirit from before.
-  - "claim" columns on PostPlan/LinkPlan rows so two runners don't post the
-    same row twice — same read-then-write pattern as before.
-Both are optimistic (read-fresh, then write) rather than hard locks, which
-is an acceptable trade-off for a per-account content queue, and it's how
-LinkPlan claiming already worked even in the Mega version.
+  CAPTION_MODE = custom   -> always use the built-in generated adult/live-cam
+                             body caption (the old behaviour; default).
+  CAPTION_MODE = sheet    -> inherit the caption from the PostPlan / LinkPlan
+                             "Caption" column for the row being posted.
+  CAPTION_MODE = mixed    -> per post, pick "sheet" with probability
+                             CAPTION_SHEET_PERCENTAGE (e.g. 50), otherwise
+                             "custom".
 
-QUOTA / RATE-LIMIT DESIGN
-────────────────────────────
-Google Sheets API default quotas are per-minute, per-project *and*
-per-user (the same service account = the same "user" across every parallel
-matrix job). Running 10+ accounts at once, each doing lots of small
-reads/writes, is exactly how you blow through that. This file is built
-around minimizing call *count*, not just being polite about it:
+  CAPTION_FALLBACK_TO_CUSTOM = true  -> if the sheet caption is empty for
+                             that row, use a generated one instead of posting
+                             without a caption. false = post with no caption.
+  CAPTION_ENABLED = false    -> no body caption at all (link/hashtags only),
+                             regardless of mode.
 
-  1. BATCH READS: Credentials + Settings + Report are fetched together in
-     ONE `values.batchGet` call per cycle (multiple ranges in one HTTP
-     request only counts once against quota). PostPlan/LinkPlan are then
-     fetched together in a second batchGet once we know their tab names
-     from Settings. That's ~2 read calls per account per cycle, full stop.
+Everything else (link style, action line, hashtags, proxies, quota-aware
+Sheets access, etc.) is unchanged. See the comments on each section.
 
-  2. BATCH WRITES: related cell updates (e.g. LOCKED_BY + LOCKED_AT, or
-     ASSIGNED_REPO + ASSIGNED_STATUS + ASSIGNED_AT) go out together via
-     `values.batchUpdate` instead of one call per cell.
+SHEETS QUOTA DESIGN (summary)
+  - batched reads (batchGet), batched writes (batchUpdate)
+  - every call wrapped in sheets_call(): exponential backoff + jitter on
+    429/5xx and on dead-connection errors (client is rebuilt)
+  - startup jitter between parallel account jobs
+  - a failed cycle never kills the job; it just waits for the next cycle
 
-  3. RETRY WITH BACKOFF: every Sheets call is wrapped in `sheets_call()`,
-     which catches 429 / RESOURCE_EXHAUSTED / rateLimitExceeded / transient
-     5xx errors and retries with exponential backoff + jitter (capped at
-     60s per wait, up to SHEETS_RETRY_BUDGET_SECONDS total). Since Google's
-     quota window is per-minute, a short backoff loop is usually enough to
-     just wait for the next window rather than treating it as a hard
-     failure.
-
-  4. STARTUP JITTER: each parallel account job sleeps a random amount
-     (0..START_JITTER_MAX_SECONDS) before its very first Sheets call, so a
-     10-account matrix doesn't fire 10 simultaneous bursts in the same
-     second right when the workflow starts.
-
-  5. NEVER GIVE UP ON THE SCHEDULE: if a cycle still can't get through after
-     the retry budget is exhausted, `run_once()` raises, `main()`'s loop
-     catches it, logs it, and sleeps until the next cycle. The account
-     keeps trying every loop_interval instead of the job exiting.
-
-PROXY SUPPORT (per-account, sheet-managed)
-────────────────────────────────────────────────────
-Each Credentials row can be given its own outbound HTTP(S) proxy, pulled
-from a "Proxies" tab in the same spreadsheet. Design:
-
-  - The Proxies tab is a pool of candidate proxies (IP / Port / optional
-    ResponseTime(s) / Status), plus tracking columns this script manages:
-    ASSIGNED_TO, ASSIGNED_AT, LAST_CHECKED, LAST_CHECK_OK.
-  - An account keeps the SAME proxy across cycles once assigned (persisted
-    in Credentials via PROXY_IP / PROXY_PORT / PROXY_ASSIGNED_AT) — it does
-    NOT reshuffle every cycle.
-  - Every cycle, before login, the currently-assigned proxy (if any) is
-    re-checked for liveness. If it's dead, it's marked "dead" in the
-    Proxies tab (so nobody else picks it) and released from the account;
-    a new, not-yet-used proxy is then claimed.
-  - Claiming a fresh proxy is optimistic-locked the same way LinkPlan rows
-    are (re-read the Status cell right before writing "assigned" to narrow
-    the race between two account jobs grabbing the same proxy).
-  - A dead proxy is marked "dead" and never handed out again; a proxy that
-    was released back to the pool (e.g. its account got banned) goes back
-    to "" (free) so it can be reused elsewhere.
-
-CALL-SITE CONVENTION FOR sheets_call()
-────────────────────────────────────────
-`sheets_call()` takes a zero-argument callable (`request_factory`) and
-calls `request_factory().execute()` on every attempt — never
-`request_factory(**kwargs)`. This matters for retries: if a network error
-triggers `_build_sheets_client()` mid-retry, a request object built once
-up front (e.g. a bound method reference captured before the loop) would
-still point at the OLD, now-dead client. Every call site below therefore
-wraps the actual Sheets API call in a `lambda: ...` so each retry
-attempt re-reads the (possibly just-rebuilt) global `_sheets` and
-re-evaluates the whole chain (including `.values()`) fresh, rather than
-passing kwargs into `sheets_call` itself for it to forward — `sheets_call`
-does not accept or forward extra kwargs.
+sheets_call() CONVENTION: it takes a zero-argument callable that builds the
+request fresh on every attempt (a lambda), so a mid-retry client rebuild is
+always picked up.
 """
 import http.client
 import io
@@ -114,7 +55,7 @@ import uuid
 from datetime import datetime
 from urllib.parse import urljoin
 
-import grapheme          # NEW – correct Bluesky grapheme counting
+import grapheme          # correct Bluesky grapheme counting
 import requests
 from bs4 import BeautifulSoup
 from atproto import Client, models
@@ -174,6 +115,14 @@ def _parse_int(raw, default):
     except ValueError:
         return default
 
+def _parse_int_allow_zero(raw, default):
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(0, int(float(str(raw).strip())))
+    except ValueError:
+        return default
+
 def get_bool_env(name, default=False):
     return _parse_bool(os.getenv(name), default)
 
@@ -213,17 +162,7 @@ CREDENTIALS_HEADER = [
     "VIDEO_COUNT_TODAY", "VIDEO_COUNT_DATE",
 ]
 
-# Base columns for a brand-new Proxies tab (only used if the tab doesn't
-# exist yet at all). If you already created the tab yourself (as in this
-# setup), ensure_extra_columns() below will just append the tracking
-# columns it needs onto the end of your existing header — it never
-# touches your existing IP/Port/ResponseTime/Status data.
 PROXIES_BASE_HEADER = ["IP", "Port", "ResponseTime(s)", "Status"]
-# Tracking columns this script owns and manages automatically. "Status" is
-# included here (not just in PROXIES_BASE_HEADER) so it gets re-added if
-# it's ever missing/deleted from an existing tab — without it there's no
-# single authoritative "assigned"/"dead" field, which is what let dead
-# proxies get reused instead of permanently skipped.
 PROXY_TRACKING_COLUMNS = ["Status", "ASSIGNED_TO", "ASSIGNED_AT", "LAST_CHECKED", "LAST_CHECK_OK"]
 
 DEFAULT_SETTINGS = [
@@ -238,6 +177,12 @@ DEFAULT_SETTINGS = [
     ("LINK_PERCENTAGE", "1.0"),
     ("MAX_IMAGE_MB", "2.0"),
     ("CAPTION_ENABLED", "true"),
+    # custom = generated captions | sheet = Caption column | mixed = random per post
+    ("CAPTION_MODE", "custom"),
+    # Only used when CAPTION_MODE=mixed: chance (0-100 or 0-1) of using the sheet caption.
+    ("CAPTION_SHEET_PERCENTAGE", "50"),
+    # If the sheet caption is empty: true = use a generated caption, false = post without one.
+    ("CAPTION_FALLBACK_TO_CUSTOM", "true"),
     ("AUTO_CAPTION_ENABLED_LINK", "true"),
     ("PREVIEW_FETCH_TIMEOUT", "15"),
     ("MAX_THUMB_MB", "1.0"),
@@ -252,26 +197,16 @@ DEFAULT_SETTINGS = [
     ("USE_PROXY", "true"),
     ("PROXY_REQUIRED", "true"),
     ("PROXY_CHECK_TIMEOUT_SECONDS", "10"),
-    # Video daily limit: 0 = unlimited. Once an account has posted this many
-    # videos today (UTC), choose_media_kind() will skip "video" and pick
-    # image/previewLink instead. Posting continues normally for other types.
     ("MAX_VIDEOS_PER_DAY", "0"),
-    # Link style for media posts that include a link:
-    #   "rich"   = always rich text with display text
-    #   "plain"  = always the raw URL as the clickable text
-    #   "random" = 50/50 (legacy behaviour)
     ("LINK_STYLE", "random"),
-    # If true, rich links ONLY use the account's LINK_DISPLAY_TEXT (no random
-    # "Live Models" / "Private Show" etc. options). Ignored when LINK_STYLE=plain.
     ("LINK_DISPLAY_TEXT_ONLY", "false"),
-    # If true (default), the action line + link sit on a new paragraph after the
-    # body caption. If false, they are appended inline (same paragraph) after
-    # the body caption with a single space.
     ("LINK_ON_NEW_LINE", "true"),
 ]
 
 POSTED_STATUS_VALUE = "posted"
 ASSIGN_STATUS_IN_USE = "In Use"
+
+CAPTION_MODES = ("custom", "sheet", "mixed")
 
 _URL_RE     = re.compile(r"https?://\S+")
 _MENTION_RE = re.compile(r"@\S+")
@@ -291,12 +226,11 @@ LINK_PREVIEW_RETRY_DELAY = 2
 
 DEFAULT_LOOP_INTERVAL_SECONDS = 1800
 
-# Used to test whether a proxy is actually usable for talking to Bluesky.
 PROXY_CHECK_URL = "https://bsky.social/xrpc/com.atproto.server.describeServer"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  RCLONE HELPERS (media files only — images/videos on Mega, unchanged)
+#  RCLONE HELPERS (media files only — images/videos on Mega)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _rclone_run(args, timeout=120):
@@ -332,12 +266,9 @@ def rclone_move(src, dst, timeout=120):
 
 GOOGLE_SHEET_ID                 = get_env("GOOGLE_SHEET_ID")
 GOOGLE_APPLICATION_CREDENTIALS  = get_env("GOOGLE_APPLICATION_CREDENTIALS", required=False) or "google_creds.json"
-SHEETS_RETRY_BUDGET_SECONDS     = get_int_env("SHEETS_RETRY_BUDGET_SECONDS", 240)   # per call
+SHEETS_RETRY_BUDGET_SECONDS     = get_int_env("SHEETS_RETRY_BUDGET_SECONDS", 240)
 SHEETS_MAX_BACKOFF_SECONDS      = get_int_env("SHEETS_MAX_BACKOFF_SECONDS", 60)
 START_JITTER_MAX_SECONDS        = get_int_env("START_JITTER_MAX_SECONDS", 45)
-# Small pause between consecutive Sheets calls from this one process, purely
-# to smooth out bursts (a cycle only makes a handful of calls, so this adds
-# at most ~1-2s of latency per cycle — cheap insurance against quota spikes).
 SHEETS_CALL_PACING_SECONDS      = _parse_plain_float(os.getenv("SHEETS_CALL_PACING_SECONDS"), 0.3)
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -350,12 +281,8 @@ _sheets  = None
 
 def _build_sheets_client():
     """(Re)build the googleapiclient service + spreadsheets() resource.
-    Called once at import, and again whenever a network-level error (as
-    opposed to a clean HTTP error response) suggests the underlying
-    connection is dead — e.g. after a long idle sleep between cycles, the
-    server or an intermediate NAT/load-balancer may have silently closed
-    the socket the client still thinks is usable, which surfaces as a raw
-    SSL/connection error rather than a normal HTTP 4xx/5xx."""
+    Called at import and whenever a network-level error suggests the
+    underlying connection is dead (common after a long sleep between cycles)."""
     global _service, _sheets
     _service = build("sheets", "v4", credentials=_creds, cache_discovery=False)
     _sheets  = _service.spreadsheets()
@@ -363,14 +290,10 @@ def _build_sheets_client():
 
 _build_sheets_client()
 
-# Exceptions that mean "the connection itself is broken", not "the server
-# gave us a proper HTTP error". These are typically what you get when a
-# long-idle keep-alive connection gets silently killed server-side or by a
-# NAT/firewall in between (very common after a 20-60 minute sleep()).
 _NETWORK_TRANSIENT_EXCEPTIONS = (
     ssl.SSLError,
-    ConnectionError,           # covers ConnectionResetError, BrokenPipeError, etc.
-    http.client.HTTPException, # covers http.client.RemoteDisconnected, BadStatusLine, etc.
+    ConnectionError,
+    http.client.HTTPException,
     TimeoutError,
     socket.timeout,
     socket.error,
@@ -398,22 +321,9 @@ def _is_quota_error(exc):
 
 def sheets_call(request_factory, budget_seconds=None):
     """Run a Sheets API request with exponential backoff + jitter on quota
-    errors, transient 5xx, AND raw network/SSL errors from dead/idle
-    connections. Retries for up to `budget_seconds` (default
-    SHEETS_RETRY_BUDGET_SECONDS) before giving up and re-raising — at which
-    point the caller (a cycle-level try/except in run_once/main) is
-    expected to skip this cycle rather than crash the whole job.
-
-    `request_factory` MUST be a zero-arg callable that BUILDS the request
-    fresh each attempt (e.g. `lambda: _sheets.values().get(spreadsheetId=...,
-    range=...)`), rather than a pre-bound method or a method reference with
-    kwargs tacked onto this call. This matters: if a network error triggers
-    a client rebuild mid-retry, a pre-bound method (or one captured before
-    the retry loop starts) would still point at the old (dead) client
-    object. A zero-arg lambda re-reads the (possibly just-rebuilt) global
-    `_sheets` on every attempt. `sheets_call` itself does not accept or
-    forward any Sheets API kwargs — all of that belongs inside the lambda
-    passed in by the caller."""
+    errors, transient 5xx, and raw network/SSL errors. `request_factory`
+    MUST be a zero-arg callable (lambda) that builds the request fresh each
+    attempt so a rebuilt client is always used."""
     budget = budget_seconds if budget_seconds is not None else SHEETS_RETRY_BUDGET_SECONDS
     start = time.time()
     attempt = 0
@@ -449,10 +359,6 @@ def sheets_call(request_factory, budget_seconds=None):
             delay = min(SHEETS_MAX_BACKOFF_SECONDS, 2 * (2 ** (attempt - 1))) + random.uniform(0, 1.5)
             print(f"[sheets] network/connection error (attempt {attempt}, {elapsed:.0f}s elapsed): "
                   f"{exc!r} — rebuilding client and retrying in {delay:.1f}s…")
-            # The whole reason this happens is a stale/dead connection the
-            # client is still holding onto (usually after a long sleep()
-            # between cycles). Rebuilding gets a fresh connection instead
-            # of retrying against the same dead socket.
             try:
                 _build_sheets_client()
             except Exception as rebuild_exc:
@@ -461,8 +367,6 @@ def sheets_call(request_factory, budget_seconds=None):
 
 
 def qrange(tab, a1):
-    """Build an A1 range reference for a tab, quoting the tab name (safe
-    even if it contains spaces or special characters)."""
     safe = tab.replace("'", "''")
     return f"'{safe}'!{a1}"
 
@@ -503,9 +407,7 @@ def sheets_update(rng, values):
 
 
 def sheets_batch_update_values(data):
-    """data: list of {'range': A1_range, 'values': [[...]]}. One HTTP call
-    no matter how many ranges are included — always prefer this over
-    several sheets_update() calls when writing related cells together."""
+    """data: list of {'range': A1_range, 'values': [[...]]}. One HTTP call."""
     if not data:
         return None
     return sheets_call(
@@ -542,20 +444,8 @@ REQUIRED_TABS = {
 
 
 def ensure_required_tabs():
-    """One-time (per job start) check that Credentials/Settings/Report/
-    Proxies tabs and their headers exist.
-
-    Matching against existing tab titles is done case-/whitespace-
-    insensitively, because Google Sheets itself treats names like
-    "Proxies" and "Proxies " (or different casing) as colliding when you
-    try to create one — so an exact-match check can miss a tab that's
-    really already there and then blow up trying to "create" it.
-
-    Tabs are created one at a time (not as a single multi-request
-    batchUpdate) and any "already exists" error is treated as a harmless
-    no-op rather than a crash, since Sheets batchUpdate requests are
-    all-or-nothing: one bad addSheet in a combined call would otherwise
-    block every other tab in the same call from being created too."""
+    """Create missing tabs (case/whitespace-insensitive match), one at a time,
+    treating 'already exists' as a harmless no-op."""
     existing = sheets_existing_titles()
     existing_norm = {str(t).strip().lower() for t in existing}
 
@@ -587,11 +477,7 @@ def ensure_required_tabs():
 
 
 def ensure_extra_columns(tab, required_headers):
-    """Append any of `required_headers` that are missing from `tab`'s
-    header row, as new trailing columns. Never touches or reorders any
-    existing columns/data — safe to call on a tab you already populated
-    yourself (e.g. a Proxies tab you built with IP/Port/ResponseTime(s)/
-    Status already in it)."""
+    """Append any missing headers as trailing columns; never touches existing data."""
     res = sheets_get(qrange(tab, "1:1"))
     rows = res.get("values", [])
     existing_header = rows[0] if rows else []
@@ -613,11 +499,11 @@ def ensure_settings_defaults():
     if missing_rows:
         sheets_append(qrange(SETTINGS_TAB, "A:B"), missing_rows)
         print(f"Added {len(missing_rows)} missing default setting(s).")
-        load_core_data(force=True)   # refresh cache so this cycle sees them
+        load_core_data(force=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SHEET VALUE HELPERS (operate on cached 2D lists from batchGet)
+#  SHEET VALUE HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def hmap(values):
@@ -631,8 +517,8 @@ def hmap(values):
     return header
 
 def cell(values, row, col):
-    """1-based row/col cell lookup into a 2D list from batchGet (rows and
-    trailing empty cells are omitted by the API, so this pads safely)."""
+    """1-based row/col lookup into a 2D list from batchGet (pads safely).
+    NOTE: strips surrounding whitespace; internal newlines are preserved."""
     if col is None or row < 1 or row > len(values):
         return ""
     r = values[row - 1]
@@ -646,14 +532,12 @@ def cell(values, row, col):
 #  CYCLE-LEVEL DATA LOADING (batched, cached per cycle)
 # ═══════════════════════════════════════════════════════════════════════════
 
-_core_cache = None   # {"creds": [[...]], "settings": {...}, "report": [[...]]}
-_plan_cache = None   # {"key": (post_tab, link_tab), "by_tab": {tab: [[...]]}}
+_core_cache = None
+_plan_cache = None
 
 
 def load_core_data(force=False):
-    """ONE batchGet call fetching Credentials + Settings + Report together.
-    This is the single read that covers everything needed for a normal
-    posting cycle except the plan sheets."""
+    """ONE batchGet call fetching Credentials + Settings + Report together."""
     global _core_cache
     if _core_cache is not None and not force:
         return _core_cache
@@ -679,9 +563,7 @@ def load_core_data(force=False):
 
 
 def load_plan_data(post_plan_tab, link_plan_tab, force=False):
-    """ONE batchGet call fetching PostPlan + LinkPlan together (only the
-    tabs that are actually configured, and only once per unique pair of
-    names per cycle)."""
+    """ONE batchGet call fetching PostPlan + LinkPlan together."""
     global _plan_cache
     key = (post_plan_tab, link_plan_tab)
     if _plan_cache is not None and _plan_cache["key"] == key and not force:
@@ -716,6 +598,17 @@ def load_global_settings(force_refresh=False):
     return load_core_data(force=force_refresh)["settings"]
 
 
+def _normalize_caption_mode(raw):
+    mode = (raw or "").strip().lower()
+    aliases = {
+        "generated": "custom", "auto": "custom", "own": "custom",
+        "inherit": "sheet", "from_sheet": "sheet", "plan": "sheet",
+        "both": "mixed", "random": "mixed", "mix": "mixed",
+    }
+    mode = aliases.get(mode, mode)
+    return mode if mode in CAPTION_MODES else "custom"
+
+
 def load_account_config(force_refresh=False):
     global _account_config
 
@@ -742,6 +635,7 @@ def load_account_config(force_refresh=False):
 
     shared = core["settings"]
     def setting(key):
+        # per-account Credentials column (if present and filled) overrides Settings tab
         return col(key) or shared.get(key, "")
 
     raw_link     = col("LINK_URL") or "https://foodiesposts.com"
@@ -779,8 +673,14 @@ def load_account_config(force_refresh=False):
         "link_enabled_video":       _parse_bool(setting("LINK_ENABLED_VIDEO"), True),
         "link_percentage":          _parse_pct(setting("LINK_PERCENTAGE"), 1.0),
         "max_image_bytes":          int(_parse_plain_float(setting("MAX_IMAGE_MB"), 2.0) * 1024 * 1024),
+
+        # ── Caption behaviour ──────────────────────────────────────────────
         "caption_enabled":          _parse_bool(setting("CAPTION_ENABLED"), True),
+        "caption_mode":             _normalize_caption_mode(setting("CAPTION_MODE")),
+        "caption_sheet_percentage": _parse_pct(setting("CAPTION_SHEET_PERCENTAGE"), 0.5),
+        "caption_fallback_custom":  _parse_bool(setting("CAPTION_FALLBACK_TO_CUSTOM"), True),
         "auto_caption_enabled_link": _parse_bool(setting("AUTO_CAPTION_ENABLED_LINK"), True),
+
         "preview_timeout":          _parse_int(setting("PREVIEW_FETCH_TIMEOUT"), 15),
         "max_thumb_bytes":          int(_parse_plain_float(setting("MAX_THUMB_MB"), 1.0) * 1024 * 1024),
         "enable_report":            _parse_bool(setting("ENABLE_REPORT"), False),
@@ -797,7 +697,6 @@ def load_account_config(force_refresh=False):
         "account_status": col("ACCOUNT_STATUS"),
         "has_lock_columns": ("LOCKED_BY" in header and "LOCKED_AT" in header),
 
-        # ── Proxy config (per-account persisted assignment + global knobs) ──
         "use_proxy":            _parse_bool(setting("USE_PROXY"), True),
         "proxy_required":       _parse_bool(setting("PROXY_REQUIRED"), True),
         "proxy_check_timeout":  _parse_int(setting("PROXY_CHECK_TIMEOUT_SECONDS"), 10),
@@ -805,8 +704,7 @@ def load_account_config(force_refresh=False):
         "proxy_port":           col("PROXY_PORT"),
         "proxy_assigned_at":    col("PROXY_ASSIGNED_AT"),
 
-        # ── Video daily limit + link presentation ──────────────────────────
-        "max_videos_per_day":   _parse_int(setting("MAX_VIDEOS_PER_DAY"), 0),  # 0 = unlimited
+        "max_videos_per_day":   _parse_int_allow_zero(setting("MAX_VIDEOS_PER_DAY"), 0),  # 0 = unlimited
         "link_style":           (setting("LINK_STYLE") or "random").strip().lower(),
         "link_display_text_only": _parse_bool(setting("LINK_DISPLAY_TEXT_ONLY"), False),
         "link_on_new_line":     _parse_bool(setting("LINK_ON_NEW_LINE"), True),
@@ -830,9 +728,7 @@ def refresh_account_config():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  AUTO ACCOUNT-ROW ASSIGNMENT
-#  (only exercised when ACCOUNT_ROW isn't set explicitly — the shipped
-#  workflow always passes it via the matrix, so this is a fallback path)
+#  AUTO ACCOUNT-ROW ASSIGNMENT (fallback path when ACCOUNT_ROW isn't set)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def resolve_account_row():
@@ -890,7 +786,7 @@ def resolve_account_row():
         ]
         if at_col is not None:
             data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"), "values": [[now]]})
-        sheets_batch_update_values(data)   # 1 write call for all 2-3 cells
+        sheets_batch_update_values(data)
 
         data_idx = excel_row - 1
         print(f"Claimed Credentials row {data_idx} ({handle_val}) for repo '{CURRENT_REPO}'.")
@@ -904,7 +800,7 @@ def resolve_account_row():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CROSS-REPO SOFT LOCK (business-level "who owns this account row right now")
+#  CROSS-REPO SOFT LOCK
 # ═══════════════════════════════════════════════════════════════════════════
 
 class AccountLockedElsewhereError(Exception):
@@ -914,7 +810,7 @@ class AccountLockedElsewhereError(Exception):
 def try_acquire_account_lock():
     global _account_config
 
-    core = load_core_data(force=True)   # fresh read right before the check, to narrow the race window
+    core = load_core_data(force=True)
     creds_values = core["creds"]
     header = hmap(creds_values)
     by_col = header.get("LOCKED_BY")
@@ -922,7 +818,7 @@ def try_acquire_account_lock():
     excel_row = ACCOUNT_ROW + 1
 
     if by_col is None or at_col is None:
-        return True   # no lock columns configured -> treat as always acquired
+        return True
 
     locked_by     = cell(creds_values, excel_row, by_col)
     locked_at_raw = cell(creds_values, excel_row, at_col)
@@ -977,13 +873,11 @@ def _write_account_status(status):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  PROXIES (per-account assignment, persisted; live-checked every cycle)
+#  PROXIES
 # ═══════════════════════════════════════════════════════════════════════════
 
 class NoProxyAvailableError(Exception):
-    """No live, unused proxy could be found this cycle (and PROXY_REQUIRED
-    is true), or the previously-assigned proxy died and nothing else was
-    available to replace it with."""
+    """No live, unused proxy could be found this cycle (and PROXY_REQUIRED is true)."""
 
 
 def _http_proxy_url(ip, port):
@@ -991,9 +885,7 @@ def _http_proxy_url(ip, port):
 
 
 def check_proxy_alive(ip, port, timeout=10):
-    """A proxy counts as 'alive' if it can actually reach Bluesky's PDS
-    through it (not just any TCP connect) — that's the only thing that
-    matters for this workflow."""
+    """Alive = can actually reach Bluesky's PDS through the proxy."""
     proxy_url = _http_proxy_url(ip, port)
     try:
         resp = requests.get(
@@ -1031,9 +923,6 @@ def _proxy_cols(values):
 
 
 def _write_proxy_row(excel_row, cols, updates):
-    """updates: dict of {col-key -> value}; unspecified keys are left
-    untouched. Always goes out as ONE batchUpdate call regardless of how
-    many of the cells changed."""
     data = []
     for key, val in updates.items():
         col = cols.get(key)
@@ -1045,10 +934,6 @@ def _write_proxy_row(excel_row, cols, updates):
 
 
 def _find_proxy_row(ip, port):
-    """Returns (excel_row, cols, values) for the Proxies row matching
-    ip/port, or (None, None, None) if not found. Returning the already-
-    loaded `values` array lets callers read any field (e.g. ASSIGNED_TO)
-    without an extra Sheets round trip."""
     values = _load_proxies_values()
     cols = _proxy_cols(values)
     if cols["ip"] is None:
@@ -1060,13 +945,7 @@ def _find_proxy_row(ip, port):
 
 
 def _proxy_owned_by(ip, port, handle):
-    """True only if the Proxies tab currently shows THIS handle as the
-    ASSIGNED_TO owner of ip:port. Used to catch the case where an account's
-    Credentials row still has a PROXY_IP/PROXY_PORT on file that either
-    never got recorded as "assigned" (stale data from before ASSIGNED_TO
-    existed) or has since been claimed by a different account — in either
-    case this account must NOT keep reusing it, since that would mean two
-    accounts sharing one proxy."""
+    """True only if the Proxies tab shows THIS handle as ASSIGNED_TO owner."""
     excel_row, cols, values = _find_proxy_row(ip, port)
     if excel_row is None or cols["assigned_to"] is None:
         return False
@@ -1077,8 +956,6 @@ def _proxy_owned_by(ip, port, handle):
 
 
 def touch_proxy_alive(ip, port):
-    """Update LAST_CHECKED/LAST_CHECK_OK for an already-assigned proxy
-    that just passed its liveness check, without touching its assignment."""
     excel_row, cols, _values = _find_proxy_row(ip, port)
     if excel_row is None:
         return
@@ -1086,9 +963,7 @@ def touch_proxy_alive(ip, port):
 
 
 def release_or_kill_proxy(ip, port, alive):
-    """alive=False: mark the proxy 'dead' so it's never handed out again.
-    alive=True: release it back to the free pool (e.g. its account got
-    banned and no longer needs it) so another account can claim it."""
+    """alive=False: mark 'dead'. alive=True: release back to the free pool."""
     excel_row, cols, _values = _find_proxy_row(ip, port)
     if excel_row is None:
         return
@@ -1105,11 +980,7 @@ def release_or_kill_proxy(ip, port, alive):
 
 
 def _claim_proxy_row(cols, excel_row, handle):
-    """Optimistic claim: re-read the Status cell (and ASSIGNED_TO, as a
-    fallback if there's no Status column) fresh right before writing, to
-    narrow (not fully eliminate) the race between two account jobs
-    claiming the same proxy row at once — same pattern as claim_url_row()
-    for LinkPlan rows elsewhere in this file."""
+    """Optimistic claim: re-read Status (or ASSIGNED_TO) right before writing."""
     if cols["status"] is not None:
         rng = qrange(PROXIES_TAB, f"{col_letter(cols['status'])}{excel_row}")
         fresh = sheets_get(rng)
@@ -1134,10 +1005,6 @@ def _claim_proxy_row(cols, excel_row, handle):
 
 
 def find_and_claim_free_proxy(handle, timeout):
-    """Scan the Proxies tab for a free (not assigned, not dead) proxy,
-    fastest ResponseTime(s) first, live-check each candidate, and claim
-    the first one that's actually alive. Dead candidates encountered along
-    the way are marked 'dead' so future cycles skip them immediately."""
     values = _load_proxies_values()
     if not values or len(values) < 2:
         return None
@@ -1155,10 +1022,6 @@ def find_and_claim_free_proxy(handle, timeout):
         status = cell(values, excel_row, cols["status"]).lower() if cols["status"] else ""
         last_ok = cell(values, excel_row, cols["last_ok"]).lower() if cols["last_ok"] else ""
         assigned_to = cell(values, excel_row, cols["assigned_to"]).strip() if cols["assigned_to"] else ""
-        # Belt-and-suspenders: honor Status if present, but ALSO skip a row
-        # if LAST_CHECK_OK says "dead" or ASSIGNED_TO is already filled in —
-        # this way a missing/deleted Status column can't cause a dead or
-        # already-claimed proxy to look free.
         if status in ("assigned", "dead"):
             continue
         if last_ok == "dead":
@@ -1232,10 +1095,8 @@ def _clear_account_proxy():
 
 
 def ensure_account_proxy(cfg):
-    """Called once per cycle, right before login. Keeps the account on its
-    previously-assigned proxy as long as it's alive; otherwise kills it and
-    claims a fresh, not-yet-used one. Returns an 'http://ip:port' proxy URL,
-    or None if proxies are disabled (USE_PROXY=false)."""
+    """Keep the account on its assigned proxy while alive; otherwise kill it
+    and claim a fresh one. Returns 'http://ip:port' or None if disabled."""
     if not cfg.get("use_proxy", True):
         return None
 
@@ -1245,11 +1106,6 @@ def ensure_account_proxy(cfg):
     ip, port = cfg.get("proxy_ip", ""), cfg.get("proxy_port", "")
     if ip and port:
         if not _proxy_owned_by(ip, port, handle):
-            # Either stale data (this account's Credentials row still
-            # points at a proxy that was never actually recorded as
-            # "assigned" to it) or the proxy has since been claimed by a
-            # different account. Either way: this account must NOT keep
-            # using it — that would mean two accounts sharing one proxy.
             print(f"Proxy {ip}:{port} on file for {handle} is not exclusively assigned to "
                   f"this account in '{PROXIES_TAB}' — clearing the stale record and "
                   f"claiming a fresh, unshared proxy instead.")
@@ -1278,37 +1134,24 @@ def ensure_account_proxy(cfg):
 
 
 class ProxyClientBuildError(Exception):
-    """Raised when a proxy was assigned/required but could not actually be
-    attached to the atproto Client. Callers must treat this as a hard stop
-    for the cycle (no login, no post) — never as a reason to fall back to
-    posting without a proxy."""
+    """A proxy was required but could not be attached to the atproto Client.
+    Never fall back to posting without a proxy."""
 
 
 def build_bsky_client(proxy_url):
-    """Create the atproto Client, routed through `proxy_url` if given.
-
-    IMPORTANT: atproto's Client(base_url=None, *args, **kwargs) looks like
-    it forwards kwargs to httpx, but it doesn't — ClientBase.__init__ only
-    accepts (base_url, request). Passing Client(proxy=...) or
-    Client(proxies=...) directly raises TypeError (silently swallowed by a
-    naive try/except, which is how a previous version of this function
-    ended up building an UNPROXIED client and posting through it anyway).
-
-    The correct way is to build the underlying Request object yourself —
-    Request(**kwargs) forwards straight into httpx.Client(**kwargs) — and
-    hand that pre-built Request to Client(request=...).
-    """
+    """Create the atproto Client routed through `proxy_url` if given.
+    atproto's Client doesn't forward kwargs to httpx, so we build the
+    underlying Request ourselves and pass it in."""
     if not proxy_url:
         return Client()
 
     last_exc = None
     for kwargs in (
-        {"proxy": proxy_url},                                          # httpx >= 0.26
-        {"proxies": {"http://": proxy_url, "https://": proxy_url}},     # older httpx
+        {"proxy": proxy_url},
+        {"proxies": {"http://": proxy_url, "https://": proxy_url}},
     ):
         try:
             req = AtprotoRequest(**kwargs)
-            # Give slow connections / large video uploads more breathing room
             try:
                 req._client.timeout = 120.0
             except Exception:
@@ -1325,9 +1168,6 @@ def build_bsky_client(proxy_url):
 
 
 def _looks_like_proxy_error(exc):
-    """Heuristic: does this exception look like it came from the proxy
-    itself being unreachable/broken, rather than a real Bluesky API error
-    (bad credentials, account takedown, etc.)?"""
     text = f"{type(exc).__name__}: {exc}"
     markers = (
         "ProxyError", "ConnectError", "ConnectTimeout", "ReadTimeout",
@@ -1368,6 +1208,15 @@ def print_config_summary():
     print(f"  Post-type mix:            image {cfg['image_ratio']:.0%} / "
           f"video {cfg['video_ratio']:.0%} / previewLink {cfg['link_ratio']:.0%}")
     print(f"  Caption enabled:          {cfg['caption_enabled']}")
+    mode = cfg["caption_mode"]
+    if mode == "mixed":
+        print(f"  Caption mode:             mixed ({cfg['caption_sheet_percentage']:.0%} sheet / "
+              f"{1 - cfg['caption_sheet_percentage']:.0%} custom)")
+    else:
+        print(f"  Caption mode:             {mode} "
+              f"({'inherit from sheet Caption column' if mode == 'sheet' else 'built-in generated captions'})")
+    print(f"  Empty sheet caption →     "
+          f"{'use generated caption' if cfg['caption_fallback_custom'] else 'post without caption'}")
     print(f"  Hashtags on image posts:  {cfg['hashtags_enabled_image']}")
     print(f"  Hashtags on video posts:  {cfg['hashtags_enabled_video']}")
     print(f"  Hashtags on previewLink:  {cfg['hashtags_enabled_link']}")
@@ -1375,7 +1224,7 @@ def print_config_summary():
     print(f"  Link on video posts:      {cfg['link_enabled_video']}")
     print(f"  Link inclusion rate:      {cfg['link_percentage']:.0%} of eligible image/video posts")
     print(f"  Max image size:           {cfg['max_image_bytes']/(1024*1024):.2f} MB")
-    print(f"  previewLink auto-caption: {cfg['auto_caption_enabled_link']} (title+description when sheet has none)")
+    print(f"  previewLink auto-caption: {cfg['auto_caption_enabled_link']} (generated caption when sheet has none)")
     print(f"  previewLink fetch timeout:{cfg['preview_timeout']}s")
     print(f"  previewLink max thumb:    {cfg['max_thumb_bytes']/(1024*1024):.2f} MB")
     print(f"  Loop interval:            {cfg['loop_interval_seconds']}s ({cfg['loop_interval_seconds']/60:.1f} min)")
@@ -1415,16 +1264,6 @@ def print_config_summary():
 # ═══════════════════════════════════════════════════════════════════════════
 #  REPORT TAB
 # ═══════════════════════════════════════════════════════════════════════════
-# Columns (fixed, 1-based):
-#   A Timestamp (UTC) | B Handle | C Followers | D Gained
-#   E Top Post        | F Engagement | G Status
-#
-# Writing strategy: never rely on Sheets "table detection" via append to A:G
-# (that is what caused rows to land in the wrong columns when the sheet had
-# extra blank columns, filters, or a mismatched header). Instead we:
-#   1. Ensure the header row is exactly REPORT_HEADER.
-#   2. Find the next empty data row by reading column A.
-#   3. Write the 7 values into that exact A{n}:G{n} range with values.update.
 
 def _now_str():
     return time.strftime("%Y-%m-%d %H:%M", time.gmtime()) + " UTC"
@@ -1437,12 +1276,10 @@ def _parse_report_ts(s):
 
 
 def _normalize_handle(h):
-    """Compare handles without a leading @ and case-insensitively."""
     return (h or "").strip().lstrip("@").lower()
 
 
 def _sanitize_report_text(s, max_len=200):
-    """Collapse whitespace/newlines so Top Post stays in a single clean cell."""
     if s is None:
         return ""
     text = re.sub(r"[\r\n\t]+", " ", str(s))
@@ -1453,13 +1290,10 @@ def _sanitize_report_text(s, max_len=200):
 
 
 def ensure_report_header():
-    """Make sure Report!A1:G1 is exactly REPORT_HEADER. Fixes a tab that was
-    created manually with extra/missing columns so new rows always land in
-    A–G under the right titles."""
+    """Make sure Report!A1:G1 is exactly REPORT_HEADER."""
     res = sheets_get(qrange(REPORT_TAB, "1:1"))
     rows = res.get("values", [])
     existing = [str(c).strip() if c is not None else "" for c in (rows[0] if rows else [])]
-    # Pad / trim to 7 for comparison
     existing_norm = (existing + [""] * 7)[:7]
     expected = list(REPORT_HEADER)
     if existing_norm == expected:
@@ -1469,23 +1303,18 @@ def ensure_report_header():
 
 
 def _next_report_row():
-    """Return the 1-based sheet row number where the next report entry should
-    be written (first empty cell in column A after the header)."""
     res = sheets_get(qrange(REPORT_TAB, "A:A"))
     values = res.get("values", [])
-    # values[0] is header (row 1). First completely empty row after that.
     for i, row in enumerate(values):
         if i == 0:
-            continue  # skip header
+            continue
         cell0 = str(row[0]).strip() if row and row[0] is not None else ""
         if not cell0:
-            return i + 1  # 1-based
-    return len(values) + 1  # append after last used row
+            return i + 1
+    return len(values) + 1
 
 
 def _last_report_for_handle(handle):
-    """Reads from the already-cached core data — no extra API call.
-    Matches handle with or without leading @."""
     report_values = load_core_data()["report"]
     target = _normalize_handle(handle)
     for r in range(len(report_values), 1, -1):
@@ -1516,27 +1345,18 @@ def _report_due(handle, times_per_day):
 
 
 def _append_report(rows):
-    """Write one or more report rows into the correct A–G columns.
-
-    `rows` is a list of 7-element lists:
-      [Timestamp, Handle, Followers, Gained, Top Post, Engagement, Status]
-
-    Uses an explicit next-row `values.update` instead of `values.append` so
-    data cannot drift into extra columns when the sheet has blank columns,
-    filters, or a previously-mismatched header.
-    """
+    """Write report rows into exact A–G columns (explicit next-row update,
+    not values.append, so data can't drift into extra columns)."""
     if not rows:
         return
     ensure_report_header()
     start_row = _next_report_row()
-    # Normalize every row to exactly 7 columns with clean types
     clean = []
     for row in rows:
         r = list(row) + [""] * 7
         r = r[:7]
-        # A Timestamp, B Handle, C Followers, D Gained, E Top Post, F Engagement, G Status
         ts       = str(r[0] or "")
-        handle   = str(r[1] or "").lstrip("@")  # store without leading @ for consistency
+        handle   = str(r[1] or "").lstrip("@")
         try:
             followers = int(float(r[2])) if str(r[2]).strip() != "" else ""
         except (ValueError, TypeError):
@@ -1556,7 +1376,7 @@ def _append_report(rows):
     end_row = start_row + len(clean) - 1
     rng = qrange(REPORT_TAB, f"A{start_row}:G{end_row}")
     sheets_update(rng, clean)
-    load_core_data(force=True)   # refresh cache so subsequent checks this cycle see the new row
+    load_core_data(force=True)
     print(f"Report row(s) written to {REPORT_TAB}!A{start_row}:G{end_row}")
 
 
@@ -1603,8 +1423,6 @@ def _top_post_summary(client, handle, top_n, within):
 
 
 def generate_report(client, handle, cfg):
-    """All Bluesky API calls happen with no Sheets calls in between; only
-    the final _append_report touches the sheet, and only once."""
     if not _report_due(handle, cfg["report_times_per_day"]):
         print(f"Report for {handle} not due yet (limit: {cfg['report_times_per_day']}x/24h).")
         return
@@ -1620,15 +1438,14 @@ def generate_report(client, handle, cfg):
             client, handle, cfg["top_posts_count"], cfg["top_posts_within"]
         )
 
-        # Exactly 7 columns matching REPORT_HEADER / A–G
         row = [
-            _now_str(),          # A Timestamp (UTC)
-            handle.lstrip("@"),  # B Handle (no leading @)
-            total,               # C Followers (number)
-            gained,              # D Gained (number)
-            top_preview,         # E Top Post (single-line text)
-            int(top_engagement or 0),  # F Engagement (number)
-            "OK",                # G Status
+            _now_str(),
+            handle.lstrip("@"),
+            total,
+            gained,
+            top_preview,
+            int(top_engagement or 0),
+            "OK",
         ]
         _append_report([row])
         print(f"Report logged for {handle}: {total} followers ({gained:+d} since last), "
@@ -1653,7 +1470,7 @@ class AccountTakenDownError(Exception):
     """Fatal — log to sheet, disable workflow."""
 
 class NoMediaFoundError(Exception):
-    """Clean exit (code 0) — nothing postable this cycle; keep schedule running."""
+    """Clean exit (code 0) — nothing postable this cycle."""
 
 class NoPreviewError(Exception):
     """Link-preview metadata could not be fetched via cardyb or manual scrape."""
@@ -1696,25 +1513,23 @@ def get_account_hashtags():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  AUTO ADULT / LIVE-CAM CAPTIONS (unique every post, with emojis)
+#  CAPTIONS: GENERATED ("custom") + SHEET-INHERITED ("sheet") + "mixed"
 # ═══════════════════════════════════════════════════════════════════════════
 # Post layout (every media post):
 #
-#   <main body caption with emoji>
+#   <body caption — generated OR from the sheet>
 #
 #   💖 <action words> 😘 <rich "Live Models"  OR  plain actual URL>
 #
 #   #hashtag1 #hashtag2 ...
 #
 # Link is ONLY one style per post — never rich + plain together.
-# Main caption is always unique adult/body-focused text.
 
 _CAPTION_EMOJIS = [
     "🔥", "😈", "💋", "🥵", "💦", "🍑", "🍆", "❤️‍🔥", "😉", "👅",
     "💃", "🎥", "🔴", "💕", "✨", "👀", "🥰", "😏", "💖", "🌙", "😘",
 ]
 
-# Main body captions (unique adult / body / cam style)
 _BODY_CAPTION_TEMPLATES = [
     "I'm owning my body without a single thread in the way. These nipples are hard and ready for attention. {e}",
     "No clothes, no rules — just me, bare and waiting. Come closer. {e}",
@@ -1743,7 +1558,6 @@ _BODY_CAPTION_TEMPLATES = [
     "Fully exposed and loving every second of it. {e}",
 ]
 
-# Action line that sits right before the link: "💖 action words 😘"
 _ACTION_LINE_TEMPLATES = [
     "Join my private show",
     "Watch me live now",
@@ -1788,35 +1602,79 @@ def _pick_emoji():
 
 
 def generate_body_caption():
-    """Unique main body caption (adult / body focused) with trailing emoji."""
+    """Unique generated body caption with trailing emoji."""
     tmpl = random.choice(_BODY_CAPTION_TEMPLATES)
     return tmpl.format(e=_pick_emoji())
 
 
 def generate_action_line():
-    """Action words sandwiched in emojis, e.g. '💖 Join my private show 😘'."""
     words = random.choice(_ACTION_LINE_TEMPLATES)
     return f"💖 {words} 😘"
+
+
+def clean_sheet_caption(raw):
+    """Normalise a caption taken from the sheet: drop URLs (links are added
+    separately, never twice), map @mentions to this account, tidy whitespace
+    but keep intentional line breaks."""
+    if not raw:
+        return ""
+    text = str(raw).replace("\r\n", "\n").replace("\r", "\n")
+    text = _URL_RE.sub("", text)
+    text = replace_mentions(text)
+    text = "\n".join(re.sub(r"[ \t]{2,}", " ", line).strip() for line in text.split("\n"))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def resolve_body_caption(sheet_caption, allow_generated_fallback=True):
+    """Decide the body caption for ONE post according to CAPTION_MODE.
+
+    Returns (caption_text, source) where source is one of:
+      "sheet"            – caption came from the PostPlan/LinkPlan row
+      "custom"           – generated caption (chosen by mode)
+      "custom-fallback"  – sheet caption was empty, generated one used instead
+      "none"             – no caption (disabled, or empty sheet caption with
+                           fallback turned off)
+    """
+    cfg = _cfg()
+    if not cfg.get("caption_enabled", True):
+        return "", "none"
+
+    mode = cfg.get("caption_mode", "custom")
+    if mode == "mixed":
+        use_sheet = random.random() < cfg.get("caption_sheet_percentage", 0.5)
+        mode = "sheet" if use_sheet else "custom"
+
+    if mode == "custom":
+        return generate_body_caption(), "custom"
+
+    # mode == "sheet"
+    text = clean_sheet_caption(sheet_caption)
+    if text:
+        return text, "sheet"
+    if cfg.get("caption_fallback_custom", True) and allow_generated_fallback:
+        return generate_body_caption(), "custom-fallback"
+    return "", "none"
 
 
 def choose_caption_and_link_style(sheet_caption, add_link):
     """Build the post pieces matching the desired layout.
 
     Returns:
-      body_caption: str   — main adult body text
+      body_caption: str   — body text (sheet or generated, per CAPTION_MODE)
+      caption_source: str — "sheet" | "custom" | "custom-fallback" | "none"
       action_line:  str   — "💖 action words 😘" (empty if no link)
       link_mode: None | "rich" | "plain"
       rich_display: str or None
     """
     cfg = _cfg()
-    body_caption = generate_body_caption()
+    body_caption, caption_source = resolve_body_caption(sheet_caption)
 
     if not add_link:
-        return body_caption, "", None, None
+        return body_caption, caption_source, "", None, None
 
     action_line = generate_action_line()
 
-    # Honour LINK_STYLE setting: "rich" | "plain" | "random"
     style = (cfg.get("link_style") or "random").strip().lower()
     if style == "rich":
         link_mode = "rich"
@@ -1831,7 +1689,6 @@ def choose_caption_and_link_style(sheet_caption, add_link):
         bare_url = (cfg.get("link_url") or "").replace("https://", "").replace("http://", "").lower()
         only_custom = cfg.get("link_display_text_only", False)
         if only_custom:
-            # Strict: only the account's configured display text (or a safe fallback)
             rich_display = account_display if account_display and account_display.lower() not in (bare_url, "") else "Live Models"
         else:
             if account_display and account_display.lower() not in (bare_url, ""):
@@ -1839,7 +1696,7 @@ def choose_caption_and_link_style(sheet_caption, add_link):
             else:
                 rich_display = random.choice(_RICH_LINK_DISPLAY_OPTIONS)
 
-    return body_caption, action_line, link_mode, rich_display
+    return body_caption, caption_source, action_line, link_mode, rich_display
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1863,12 +1720,11 @@ def _today_utc_str():
 
 
 def get_video_count_today():
-    """Return how many videos this account has already posted today (UTC).
-    Resets automatically when the stored date is not today."""
+    """Videos this account already posted today (UTC); resets on a new day."""
     cfg = _cfg()
     max_v = cfg.get("max_videos_per_day", 0)
     if max_v <= 0:
-        return 0  # unlimited → treat as 0 used
+        return 0
     today = _today_utc_str()
     stored_date = (cfg.get("video_count_date") or "").strip()
     if stored_date != today:
@@ -1880,12 +1736,11 @@ def get_video_count_today():
 
 
 def increment_video_count():
-    """After a successful video post, bump VIDEO_COUNT_TODAY for this account."""
     global _account_config
     cfg = _cfg()
     max_v = cfg.get("max_videos_per_day", 0)
     if max_v <= 0:
-        return  # unlimited — no need to track
+        return
     today = _today_utc_str()
     current = get_video_count_today()
     new_count = current + 1
@@ -1909,9 +1764,8 @@ def increment_video_count():
 
 
 def choose_media_kind():
-    """Pick image / video / previewLink according to ratios, but never
-    choose 'video' once the account has already hit MAX_VIDEOS_PER_DAY
-    today. Other post types continue normally."""
+    """Pick image / video / previewLink by ratio; never 'video' once the
+    daily video limit is hit."""
     cfg = _cfg()
     max_v = cfg.get("max_videos_per_day", 0)
     used  = get_video_count_today() if max_v > 0 else 0
@@ -1923,11 +1777,9 @@ def choose_media_kind():
     if not video_allowed:
         print(f"Video daily limit reached ({used}/{max_v}) — skipping video this cycle, "
               f"will post image or previewLink instead.")
-        # Zero out video weight and re-normalise the remaining two
         weights = [cfg["image_ratio"], 0.0, cfg["link_ratio"]]
         total = sum(weights)
         if total <= 0:
-            # Degenerate case: only video was configured — fall back to image
             return "image"
         weights = [w / total for w in weights]
 
@@ -1939,7 +1791,7 @@ def choose_media_kind():
 # ═══════════════════════════════════════════════════════════════════════════
 
 _post_plan_cache          = None
-_post_plan_status_col_idx = None   # 1-based col index
+_post_plan_status_col_idx = None
 
 
 def get_post_plan_tab_name():
@@ -1975,10 +1827,17 @@ def load_post_plan(force_refresh=False):
     status_idx  = ci("status")
     _post_plan_status_col_idx = status_idx
 
-    if file_idx is None or caption_idx is None:
-        print(f"Warning: post-plan needs 'File Name' and 'Caption' columns. Found: {list(header)}")
+    if file_idx is None:
+        print(f"Warning: post-plan needs a 'File Name' column. Found: {list(header)}")
         _post_plan_cache = {}
         return _post_plan_cache
+    if caption_idx is None:
+        # Only a real problem if the sheet captions are actually wanted.
+        if _cfg().get("caption_mode", "custom") in ("sheet", "mixed"):
+            print("Warning: no 'Caption' column in post-plan — sheet captions will be empty "
+                  "(generated fallback applies if enabled).")
+        else:
+            print("Note: no 'Caption' column in post-plan (fine — CAPTION_MODE=custom).")
     if status_idx is None:
         print("Warning: no 'Status' column — posted files won't be tracked.")
 
@@ -1987,7 +1846,7 @@ def load_post_plan(force_refresh=False):
     already    = 0
     for excel_row in range(2, len(values) + 1):
         fname   = cell(values, excel_row, file_idx)
-        caption = cell(values, excel_row, caption_idx)
+        caption = cell(values, excel_row, caption_idx) if caption_idx else ""
         status  = cell(values, excel_row, status_idx) if status_idx else ""
         if not fname:
             continue
@@ -2066,7 +1925,7 @@ def load_link_plan(force_refresh=False):
         return None
 
     url_idx    = ci("url")
-    cap_idx    = ci("caption")
+    cap_idx    = ci("caption", "captions")
     status_idx = ci("status")
     if url_idx is None:
         raise RuntimeError(f"'{tab_name}' needs a 'URL' column.")
@@ -2096,10 +1955,7 @@ def pick_next_url():
 
 
 def claim_url_row(entry):
-    """Read-fresh-then-write on just this one cell to narrow (not fully
-    eliminate) the race between two runners claiming the same LinkPlan row.
-    This mirrors how LinkPlan claiming already worked before the Mega
-    rewrite — it's an optimistic claim, not a hard lock."""
+    """Optimistic claim: re-read the cell, then write."""
     if entry["status_col"] is None:
         return True
     tab_name  = get_link_plan_tab_name()
@@ -2110,7 +1966,7 @@ def claim_url_row(entry):
     current_rows = fresh.get("values", [])
     current = str(current_rows[0][0]).strip() if current_rows and current_rows[0] else ""
     if current.lower() == POSTED_STATUS_VALUE or current.lower().startswith(CLAIM_PREFIX.lower()):
-        return False   # someone else got there first
+        return False
 
     sheets_update(rng, [[claim_val]])
     return True
@@ -2265,12 +2121,32 @@ def _compress_link_thumb(data, max_bytes):
 
 
 MAX_POST_GRAPHEMES = 300
-SAFETY_MARGIN = 5   # leave a few graphemes of headroom for Bluesky's stricter counting
+SAFETY_MARGIN = 5
 
 
 def grapheme_len(s: str) -> int:
-    """Correct Unicode grapheme cluster count (what Bluesky actually enforces)."""
+    """Unicode grapheme cluster count (what Bluesky actually enforces)."""
     return grapheme.length(s)
+
+
+def _trim_to_budget(text, budget):
+    """Trim `text` (with a trailing ellipsis) so it fits `budget` graphemes."""
+    if budget <= 0 or not text:
+        return ""
+    if grapheme_len(text) <= budget:
+        return text
+    lo, hi, best = 0, len(text), ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        trial = text[:mid].rstrip()
+        if mid < len(text):
+            trial += "…"
+        if grapheme_len(trial) <= budget:
+            best = trial
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 def build_link_caption_text(caption, tags, fallback_url=None):
@@ -2278,49 +2154,25 @@ def build_link_caption_text(caption, tags, fallback_url=None):
     if fallback_url:
         text = f"{text}\n{fallback_url}".strip(" \t\r") if text else fallback_url
 
-    tb = TextBuilder()
-    if text:
-        tb.text(text)
-    if tags:
-        if text:
-            tb.text("\n\n")
-        for i, tag in enumerate(tags):
-            tb.tag(f"#{tag}", tag)
-            if i < len(tags) - 1:
-                tb.text(" ")
-
-    plain = tb.build_text()
-    if grapheme_len(plain) > MAX_POST_GRAPHEMES - SAFETY_MARGIN:
-        hashtag_block = ("\n\n" + " ".join(f"#{t}" for t in tags)) if tags else ""
-        budget = MAX_POST_GRAPHEMES - SAFETY_MARGIN - grapheme_len(hashtag_block)
-        # Trim the text part to fit within the remaining budget
-        if budget > 0 and text:
-            # Simple binary search on character positions (good enough)
-            lo, hi, best = 0, len(text), ""
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                trial = text[:mid].rstrip()
-                if mid < len(text):
-                    trial += "…"
-                if grapheme_len(trial) <= budget:
-                    best = trial
-                    lo = mid + 1
-                else:
-                    hi = mid - 1
-            text = best
-        else:
-            text = ""
-
+    def _make(t):
         tb = TextBuilder()
-        if text:
-            tb.text(text)
+        if t:
+            tb.text(t)
         if tags:
-            if text:
+            if t:
                 tb.text("\n\n")
             for i, tag in enumerate(tags):
                 tb.tag(f"#{tag}", tag)
                 if i < len(tags) - 1:
                     tb.text(" ")
+        return tb
+
+    tb = _make(text)
+    limit = MAX_POST_GRAPHEMES - SAFETY_MARGIN
+    if grapheme_len(tb.build_text()) > limit:
+        hashtag_block = ("\n\n" + " ".join(f"#{t}" for t in tags)) if tags else ""
+        budget = limit - grapheme_len(hashtag_block)
+        tb = _make(_trim_to_budget(text, budget))
     return tb
 
 
@@ -2351,6 +2203,9 @@ def compose_fallback_caption(preview):
 
 
 def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes, auto_caption_enabled=True):
+    """previewLink post. Caption follows CAPTION_MODE (sheet / custom / mixed).
+    AUTO_CAPTION_ENABLED_LINK only governs the generated *fallback* used when
+    the sheet caption is empty."""
     print(f"[previewLink] Fetching preview for: {url}")
     preview = None
     embed = None
@@ -2361,31 +2216,26 @@ def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes, auto_ca
     except Exception as exc:
         print(f"Warning: preview fetch failed ({exc}); posting as plain link instead.")
 
-    used_auto_caption = False
-    effective_caption = (caption or "").strip()
-    if effective_caption:
-        effective_caption = _URL_RE.sub("", effective_caption).strip()
-    if not effective_caption and auto_caption_enabled:
-        # Prefer unique adult/live-cam auto caption; fall back to preview title+desc only if disabled.
-        effective_caption = generate_body_caption()
-        used_auto_caption = True
-        print(f"No Caption in sheet — using auto adult caption: {effective_caption!r}")
-    elif not effective_caption and not auto_caption_enabled:
-        print("No Caption in sheet and previewLink auto-caption is off — posting without a caption.")
+    effective_caption, caption_source = resolve_body_caption(
+        caption, allow_generated_fallback=auto_caption_enabled
+    )
+    if caption_source == "none":
+        print("No caption used for this previewLink post "
+              "(disabled, or empty sheet caption with fallback/auto-caption off).")
+    else:
+        print(f"previewLink caption source: {caption_source} → {effective_caption!r}")
 
-    # For previewLink posts the embed already carries the destination URL, so we
-    # do not also put a rich/plain link in the text (avoids double links).
+    # The embed already carries the destination URL, so no extra link in text.
     tb = build_link_caption_text(effective_caption, tags, fallback_url=(url if preview is None else None))
     client.send_post(text=tb, embed=embed)
 
     posted_url = preview["final_url"] if preview else url
-    caption_source = "auto (adult/live-cam)" if used_auto_caption else ("sheet" if caption else "no")
     print(f"✓ Posted {'link card' if embed else 'plain link'} for {posted_url} "
           f"(caption={caption_source}, tags={len(tags)})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MEGA.NZ HELPERS (via rclone) — image/video media, unchanged
+#  MEGA.NZ HELPERS (via rclone) — image/video media
 # ═══════════════════════════════════════════════════════════════════════════
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".avif", ".heic"}
@@ -2508,13 +2358,15 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
     """
     Priority when the post is too long:
       1. Keep full body caption (highest priority)
-      2. Keep as many hashtags as possible (drop only the ones that overflow)
-      3. Drop action line if still needed
+      2. Keep as many hashtags as possible
+      3. Drop action line + link if still needed
       4. Only as last resort → trim body caption
+    Works the same for sheet-inherited and generated captions.
     """
     cfg = _cfg()
-    text = replace_mentions(body_caption) if body_caption else ""
-    text = _URL_RE.sub("", text).strip() if text else ""
+    # body_caption is already cleaned (URLs removed, mentions mapped) by
+    # resolve_body_caption(); this is a harmless second pass for safety.
+    text = _URL_RE.sub("", body_caption).strip() if body_caption else ""
     tags = tags or []
 
     on_new_line = cfg.get("link_on_new_line", True)
@@ -2525,12 +2377,8 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
             tb.text(caption_text)
 
         if link_mode in ("rich", "plain") and use_action:
-            if on_new_line:
-                tb.text("\n\n")
-            else:
-                # Inline: single space after body caption
-                if caption_text:
-                    tb.text(" ")
+            if caption_text:
+                tb.text("\n\n" if on_new_line else " ")
             if action_line:
                 tb.text(action_line + " ")
             url = cfg["link_url"]
@@ -2541,7 +2389,8 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
                 tb.link(url, url)
 
         if tag_list:
-            tb.text("\n\n")
+            if caption_text or (link_mode in ("rich", "plain") and use_action):
+                tb.text("\n\n")
             for i, tag in enumerate(tag_list):
                 tb.tag(f"#{tag}", tag)
                 if i < len(tag_list) - 1:
@@ -2550,70 +2399,68 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
 
     limit = MAX_POST_GRAPHEMES - SAFETY_MARGIN
 
-    # ── 1. Try full version ────────────────────────────────────────────────
-    tb = _assemble(text, use_action=True, tag_list=tags)
-    if grapheme_len(tb.build_text()) <= limit:
-        return tb
+    def _fits(caption_text, use_action, tag_list):
+        return grapheme_len(_assemble(caption_text, use_action, tag_list).build_text()) <= limit
 
-    # ── 2. Keep full caption + action, reduce hashtags until it fits ───────
-    if tags:
-        # Binary search: find the maximum number of hashtags that still fit
+    def _max_tags(use_action):
         lo, hi, best_n = 0, len(tags), 0
         while lo <= hi:
             mid = (lo + hi) // 2
-            trial_tags = tags[:mid]
-            if grapheme_len(_assemble(text, use_action=True, tag_list=trial_tags).build_text()) <= limit:
+            if _fits(text, use_action, tags[:mid]):
                 best_n = mid
                 lo = mid + 1
             else:
                 hi = mid - 1
+        return best_n
 
-        if best_n > 0:
-            print(f"Caption too long → kept {best_n}/{len(tags)} hashtags to fit limit.")
-            return _assemble(text, use_action=True, tag_list=tags[:best_n])
+    # 1. Full version
+    if _fits(text, True, tags):
+        return _assemble(text, True, tags)
 
-    # ── 3. Drop action line, keep as many hashtags as possible ─────────────
+    # 2. Full caption + action/link, fewer hashtags
     if tags:
-        lo, hi, best_n = 0, len(tags), 0
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            trial_tags = tags[:mid]
-            if grapheme_len(_assemble(text, use_action=False, tag_list=trial_tags).build_text()) <= limit:
-                best_n = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
+        n = _max_tags(True)
+        if n > 0:
+            print(f"Caption too long → kept {n}/{len(tags)} hashtags to fit limit.")
+            return _assemble(text, True, tags[:n])
 
-        if best_n > 0:
-            print(f"Caption too long → dropped action line, kept {best_n}/{len(tags)} hashtags.")
-            return _assemble(text, use_action=False, tag_list=tags[:best_n])
+    # 2b. Full caption + action/link, no hashtags
+    if _fits(text, True, []):
+        print("Caption too long → dropped all hashtags (kept action line + link).")
+        return _assemble(text, True, [])
 
-    # ── 4. No hashtags + no action line ────────────────────────────────────
-    tb = _assemble(text, use_action=False, tag_list=[])
-    if grapheme_len(tb.build_text()) <= limit:
+    # 3. Drop action line + link, keep as many hashtags as possible
+    if tags:
+        n = _max_tags(False)
+        if n > 0:
+            print(f"Caption too long → dropped action line, kept {n}/{len(tags)} hashtags.")
+            return _assemble(text, False, tags[:n])
+
+    # 4. No hashtags + no action line
+    if _fits(text, False, []):
         print("Caption too long → dropped action line and all hashtags.")
-        return tb
+        return _assemble(text, False, [])
 
-    # ── 5. Last resort: trim body caption ──────────────────────────────────
+    # 5. Last resort: trim body caption
     print(f"Caption still too long even after dropping hashtags/action "
-          f"({grapheme_len(tb.build_text())} graphemes). Trimming body caption…")
-
+          f"({grapheme_len(_assemble(text, False, []).build_text())} graphemes). Trimming body caption…")
     lo, hi, best_text = 0, len(text), ""
     while lo <= hi:
         mid = (lo + hi) // 2
         trial = text[:mid].rstrip()
         if mid < len(text):
             trial += "…"
-        if grapheme_len(_assemble(trial, use_action=False, tag_list=[]).build_text()) <= limit:
+        if _fits(trial, False, []):
             best_text = trial
             lo = mid + 1
         else:
             hi = mid - 1
+    return _assemble(best_text, False, [])
 
-    return _assemble(best_text, use_action=False, tag_list=[])
 
 def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_link):
-    body_caption, action_line, link_mode, rich_display = choose_caption_and_link_style(caption, add_link)
+    body_caption, caption_source, action_line, link_mode, rich_display = \
+        choose_caption_and_link_style(caption, add_link)
     tb = build_post_from_caption(
         body_caption, action_line, tags,
         link_mode=link_mode, rich_display=rich_display,
@@ -2630,7 +2477,7 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
         link_info = f"rich[{rich_display}]"
     elif link_mode == "plain":
         link_info = "plain-url"
-    print(f"✓ Posted {kind}: {body_caption!r}")
+    print(f"✓ Posted {kind} (caption source: {caption_source}): {body_caption!r}")
     if action_line:
         print(f"  Action: {action_line} → {link_info}")
     if tags:
@@ -2641,27 +2488,26 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 #  DISCOVER MODE
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _claim_row_writes(excel_row, repo_col, astatus_col, at_col):
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    data = []
+    if repo_col is not None:
+        data.append({"range": qrange(CREDS_TAB, f"{col_letter(repo_col)}{excel_row}"),
+                     "values": [[CURRENT_REPO]]})
+    if astatus_col is not None:
+        data.append({"range": qrange(CREDS_TAB, f"{col_letter(astatus_col)}{excel_row}"),
+                     "values": [[ASSIGN_STATUS_IN_USE]]})
+    if at_col is not None:
+        data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"),
+                     "values": [[now]]})
+    if data:
+        sheets_batch_update_values(data)
+
+
 def run_discover():
-    """Discover which account rows THIS repo should run.
-
-    Sticky assignment rules (secure across multiple repositories sharing the
-    same sheet):
-
-      1. Accounts already ASSIGNED_REPO == CURRENT_REPO and not banned stay
-         owned by this repo forever (until you manually clear the columns).
-      2. Accounts assigned to ANY other repo are never touched by us.
-      3. Unassigned free accounts can be claimed by this repo, but only up to
-         the remaining slots under MAX_ACCOUNTS_PER_RUN.
-      4. MAX_ACCOUNTS_PER_RUN is the hard ceiling on how many jobs this
-         workflow will launch. Once a repo has claimed its quota, future
-         schedules of the same repo keep running exactly those same accounts
-         and never steal more.
-
-    This guarantees that two (or more) repos running the same workflow against
-    the same Google Sheet never fight over the same account rows.
-    """
+    """Discover which account rows THIS repo should run (sticky assignment,
+    capped by MAX_ACCOUNTS_PER_RUN, never touching rows owned by other repos)."""
     ensure_required_tabs()
-    # Make sure the assignment + video-tracking columns exist
     ensure_extra_columns(CREDS_TAB, [
         "ASSIGNED_REPO", "ASSIGNED_STATUS", "ASSIGNED_AT",
         "VIDEO_COUNT_TODAY", "VIDEO_COUNT_DATE",
@@ -2700,9 +2546,8 @@ def run_discover():
         print(f"FORCE_ACCOUNT_ROW set — running only row {eligible[0]} "
               f"(eligibility filter, assignment lock and MAX_ACCOUNTS_PER_RUN cap skipped).")
     else:
-        # ── Phase 1: collect rows already owned by THIS repo ──────────────
         owned = []
-        free  = []   # candidate free rows we could claim
+        free  = []
 
         for excel_row in range(2, len(creds_values) + 1):
             handle = cell(creds_values, excel_row, handle_col)
@@ -2718,17 +2563,13 @@ def run_discover():
 
             data_idx = excel_row - 1
             if assigned_repo == CURRENT_REPO:
-                # Already ours — keep it (even if status column is weird)
                 owned.append(data_idx)
                 print(f"  Owned by us: row {data_idx} ({handle})")
             elif assigned_repo and assigned_status.lower() == ASSIGN_STATUS_IN_USE.lower():
-                # Locked to another repo — never touch
                 print(f"  Locked by other repo '{assigned_repo}': row {data_idx} ({handle}) — skipped")
             else:
-                # Free (unassigned or previously released)
                 free.append((data_idx, excel_row, handle))
 
-        # ── Phase 2: apply MAX_ACCOUNTS_PER_RUN ceiling ───────────────────
         limit_raw = get_env("MAX_ACCOUNTS_PER_RUN", required=False)
         if not limit_raw:
             limit_raw = core["settings"].get("MAX_ACCOUNTS_PER_RUN", "")
@@ -2742,49 +2583,19 @@ def run_discover():
 
         if limit is not None:
             print(f"MAX_ACCOUNTS_PER_RUN={limit} — this repo may run at most {limit} account(s).")
-            # Keep already-owned rows first (they may already exceed the limit if
-            # the setting was lowered later — we still honour existing ownership).
             if len(owned) > limit:
                 print(f"Note: this repo already owns {len(owned)} accounts (more than the current "
                       f"limit of {limit}). Continuing with all owned accounts; no new claims.")
-                eligible = owned
             else:
                 slots_left = limit - len(owned)
-                # Claim additional free rows up to the remaining slots
-                to_claim = free[:slots_left]
-                for data_idx, excel_row, handle in to_claim:
-                    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                    data = []
-                    if repo_col is not None:
-                        data.append({"range": qrange(CREDS_TAB, f"{col_letter(repo_col)}{excel_row}"),
-                                     "values": [[CURRENT_REPO]]})
-                    if astatus_col is not None:
-                        data.append({"range": qrange(CREDS_TAB, f"{col_letter(astatus_col)}{excel_row}"),
-                                     "values": [[ASSIGN_STATUS_IN_USE]]})
-                    if at_col is not None:
-                        data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"),
-                                     "values": [[now]]})
-                    if data:
-                        sheets_batch_update_values(data)
+                for data_idx, excel_row, handle in free[:slots_left]:
+                    _claim_row_writes(excel_row, repo_col, astatus_col, at_col)
                     print(f"  Claimed free row {data_idx} ({handle}) for repo '{CURRENT_REPO}'.")
                     owned.append(data_idx)
-                eligible = owned
+            eligible = owned
         else:
-            # No limit: keep all owned + claim every free row
             for data_idx, excel_row, handle in free:
-                now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                data = []
-                if repo_col is not None:
-                    data.append({"range": qrange(CREDS_TAB, f"{col_letter(repo_col)}{excel_row}"),
-                                 "values": [[CURRENT_REPO]]})
-                if astatus_col is not None:
-                    data.append({"range": qrange(CREDS_TAB, f"{col_letter(astatus_col)}{excel_row}"),
-                                 "values": [[ASSIGN_STATUS_IN_USE]]})
-                if at_col is not None:
-                    data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"),
-                                 "values": [[now]]})
-                if data:
-                    sheets_batch_update_values(data)
+                _claim_row_writes(excel_row, repo_col, astatus_col, at_col)
                 print(f"  Claimed free row {data_idx} ({handle}) for repo '{CURRENT_REPO}'.")
                 owned.append(data_idx)
             eligible = owned
@@ -2811,6 +2622,12 @@ def run_discover():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_once():
+    # Drop per-cycle plan caches so edits to captions/status in the sheet
+    # (e.g. switching CAPTION_MODE or editing a Caption cell) take effect.
+    global _plan_cache, _post_plan_cache
+    _plan_cache = None
+    _post_plan_cache = None
+
     cfg = refresh_account_config()
 
     if not try_acquire_account_lock():
@@ -2820,17 +2637,13 @@ def run_once():
 
     handle = cfg["handle"]
 
-    # Get (or keep) a live proxy for this account before doing anything else.
     proxy_url = ensure_account_proxy(cfg)
-    cfg = _cfg()   # pick up any proxy_ip/proxy_port just written to the cache
+    cfg = _cfg()
 
     print_target_account(handle)
     try:
         client = build_bsky_client(proxy_url)
     except ProxyClientBuildError as exc:
-        # A proxy was required/assigned but couldn't actually be attached
-        # to the HTTP client — do NOT fall back to an unproxied client.
-        # Skip this cycle entirely; nothing gets logged in or posted.
         raise NoProxyAvailableError(str(exc)) from exc
 
     try:
@@ -2916,9 +2729,10 @@ def run_once():
         hashtags_on = cfg["hashtags_enabled_image"] if kind == "image" else cfg["hashtags_enabled_video"]
         tags = get_account_hashtags() if hashtags_on else []
         add_link = should_add_link(kind)
-        caption_to_use = caption if cfg.get("caption_enabled", True) else ""
 
-        post_to_bluesky(client, original_name, path, kind, caption_to_use, tags, add_link)
+        # The raw sheet caption is passed through; CAPTION_MODE / CAPTION_ENABLED
+        # are applied inside resolve_body_caption().
+        post_to_bluesky(client, original_name, path, kind, caption, tags, add_link)
 
     except Exception as exc:
         err = str(exc)
@@ -2956,7 +2770,7 @@ def main():
         ])
         ensure_extra_columns(PROXIES_TAB, PROXY_TRACKING_COLUMNS)
         ensure_settings_defaults()
-        ensure_report_header()   # keep Report A1:G1 aligned so rows land in correct columns
+        ensure_report_header()
         ACCOUNT_ROW = resolve_account_row()
         load_account_config()
     except Exception as exc:
@@ -2964,7 +2778,7 @@ def main():
         sys.exit(1)
 
     print_config_summary()
-    print(f"Starting loop. Loop interval and post-type mix are read from the "
+    print(f"Starting loop. Loop interval, post-type mix and caption mode are read from the "
           f"Settings tab of the Google Sheet and re-checked at the start of "
           f"every cycle — edit them there any time, no redeploy needed.")
 
@@ -2990,7 +2804,6 @@ def main():
             print(f"\n{'='*60}\n{err_str}\n→ {reason}\n{'='*60}\n")
             _write_account_status(reason)
             log_account_problem(handle, status=reason)
-            # This account is done for good — free up its proxy for others.
             ip, port = (_account_config or {}).get("proxy_ip", ""), (_account_config or {}).get("proxy_port", "")
             if ip and port:
                 release_or_kill_proxy(ip, port, alive=True)
@@ -3000,16 +2813,11 @@ def main():
             sys.exit(1)
         except Exception as exc:
             # Includes exhausted-quota-retry-budget errors from sheets_call().
-            # We deliberately do NOT exit here — the whole point of the retry
-            # budget + this catch-all is that a bad cycle (quota, transient
-            # network blip, whatever) costs you one cycle, not the account.
+            # A bad cycle costs one cycle, not the account.
             print(f"Error during cycle: {type(exc).__name__}: {exc}")
-            traceback.print_exc()          # ← full stack trace now visible in GitHub Actions logs
+            traceback.print_exc()
 
         loop_interval = (_account_config or {}).get("loop_interval_seconds", DEFAULT_LOOP_INTERVAL_SECONDS)
-        # Small extra jitter on top of the configured interval so many
-        # parallel account jobs don't all re-hit the Sheets API in the same
-        # second forever, even if they all started in sync.
         loop_interval = loop_interval + random.uniform(0, min(30, loop_interval * 0.05))
         elapsed   = time.time() - cycle_start
         sleep_for = max(0, loop_interval - elapsed)
