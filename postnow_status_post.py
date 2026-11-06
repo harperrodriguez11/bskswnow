@@ -75,7 +75,33 @@ LOCK_TTL_MINUTES = 45   # business-level "which repo owns this account row" hear
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENV / VALUE PARSING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
-
+def ensure_real_mp4(local_path):
+    """Bluesky rejects MOV/QuickTime data even when the file is named .mp4.
+    Re-wrap into a true MP4 container (stream copy, no quality loss);
+    fall back to a re-encode if copy isn't possible."""
+    base = os.path.splitext(local_path)[0]
+    out = f"{base}_fixed.mp4"
+    attempts = [
+        ["ffmpeg", "-y", "-i", local_path, "-c", "copy",
+         "-movflags", "+faststart", out],
+        ["ffmpeg", "-y", "-i", local_path, "-c:v", "libx264", "-preset", "veryfast",
+         "-crf", "23", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+         "-movflags", "+faststart", out],
+    ]
+    for cmd in attempts:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                print(f"Re-wrapped video as MP4 ({'copy' if '-c' in cmd and 'copy' in cmd else 're-encode'}).")
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+                return out
+        except Exception as exc:
+            print(f"Warning: ffmpeg step failed: {exc}")
+    print("Warning: could not convert video; posting original file.")
+    return local_path
 def get_env(name, required=True, default=""):
     v = os.getenv(name)
     if v is None or not v.strip():
@@ -2724,6 +2750,8 @@ def run_once():
     try:
         if kind == "image":
             path = compress_image_under_limit(path)
+        elif kind == "video":
+            path = ensure_real_mp4(path)
 
         cfg = _cfg()
         hashtags_on = cfg["hashtags_enabled_image"] if kind == "image" else cfg["hashtags_enabled_video"]
